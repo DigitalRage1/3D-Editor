@@ -927,7 +927,9 @@ export class Editor {
                 name: meshData.materialName || 'Imported Material'
             });
             const mesh = new Mesh(materialData);
-            if (meshData.polygons) {
+            if (meshData.positions && meshData.faces) {
+                mesh.setTopology(meshData.positions, meshData.faces);
+            } else if (meshData.polygons) {
                 mesh.polygons = meshData.polygons.map(polygon => polygon.map(vertex => [...vertex]));
             } else {
                 let vertices = meshData.vertices || [];
@@ -940,7 +942,7 @@ export class Editor {
                         ? Array.from({ length: faces.length / 3 }, (_, index) => faces.slice(index * 3, index * 3 + 3))
                         : [faces];
                 }
-                mesh.polygons = faces.map(face => face.map(index => [...vertices[index]]));
+                mesh.setTopology(vertices, faces);
             }
             mesh.name = meshData.name || 'Imported Mesh';
             mesh.prefabInstance = meshData.prefabInstance ? JSON.parse(JSON.stringify(meshData.prefabInstance)) : null;
@@ -985,14 +987,15 @@ export class Editor {
             mesh.selectedBone = mesh.skeleton.bones.length ? 0 : null;
 
             meshData.vertexWeights?.forEach((polygonWeights, faceIndex) => polygonWeights.forEach((entry, vertexIndex) => {
-                const vertex = mesh.polygons[faceIndex]?.[vertexIndex];
+                const sharedVertexIndex = mesh.faces[faceIndex]?.[vertexIndex];
+                const vertex = mesh.positions[sharedVertexIndex];
                 if (!vertex || !entry.weights?.length) return;
                 const weights = new Map();
                 entry.weights.forEach(weight => {
                     const bone = boneMap.get(weight.bone);
                     if (bone) weights.set(bone, weight.weight);
                 });
-                if (weights.size) mesh.vertexWeights.set(vertex, {
+                if (weights.size) mesh.vertexWeights.set(sharedVertexIndex, {
                     bindPosition: [...(entry.bindPosition || vertex)],
                     weights
                 });
@@ -1118,7 +1121,7 @@ export class Editor {
         duplicate.position = source.position.map((value, axis) => value + (axis === 0 ? 1 : 0));
         duplicate.rotation = [...source.rotation];
         duplicate.scale = [...source.scale];
-        duplicate.polygons = source.polygons.map(polygon => polygon.map(vertex => [...vertex]));
+        duplicate.setTopology(source.positions, source.faces);
         duplicate.faceColors = source.faceColors.map(color => [...color]);
         duplicate.faceTextures = [...source.faceTextures];
         duplicate.faceTextureIds = [...source.faceTextureIds];
@@ -1145,11 +1148,12 @@ export class Editor {
             bones.set(bone, cloned);
         });
         source.polygons.forEach((polygon, faceIndex) => polygon.forEach((vertex, vertexIndex) => {
-            const skin = source.vertexWeights.get(vertex);
+            const sharedVertexIndex = source.faces[faceIndex]?.[vertexIndex];
+            const skin = source.vertexWeights.get(sharedVertexIndex);
             if (!skin) return;
-            const duplicateVertex = duplicate.polygons[faceIndex]?.[vertexIndex];
-            if (!duplicateVertex) return;
-            duplicate.vertexWeights.set(duplicateVertex, {
+            const duplicateVertexIndex = duplicate.faces[faceIndex]?.[vertexIndex];
+            if (duplicateVertexIndex === undefined) return;
+            duplicate.vertexWeights.set(duplicateVertexIndex, {
                 bindPosition: [...skin.bindPosition],
                 weights: new Map([...skin.weights].map(([bone, weight]) => [bones.get(bone), weight]).filter(([bone]) => bone))
             });
@@ -1235,6 +1239,8 @@ export class Editor {
                     emission: mesh.material.textureSlots?.emission?.id || null
                 },
                 polygons: mesh.polygons,
+                positions: mesh.positions.map(position => [...position]),
+                faces: mesh.faces.map(face => [...face]),
                 faceColors: mesh.faceColors,
                 textureAssetId: mesh.textureAssetId,
                 faceTextureIds: mesh.faceTextureIds,
@@ -1368,6 +1374,8 @@ export class Editor {
                 color: mesh.material.color,
                 shading: mesh.material.shading,
                 polygons: mesh.polygons,
+                positions: mesh.positions.map(position => [...position]),
+                faces: mesh.faces.map(face => [...face]),
                 faceColors: mesh.faceColors,
                 textureAssetId: mesh.textureAssetId,
                 faceTextureIds: mesh.faceTextureIds,

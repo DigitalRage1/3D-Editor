@@ -24,6 +24,7 @@ import { AnimationClip } from '../engine/animation.js';
 import { DirectionalLight } from '../engine/light.js';
 import { SceneManager } from '../engine/sceneManager.js';
 import { AssetManager } from '../engine/assetManager.js';
+import { PrefabManager } from '../engine/prefabManager.js';
 import { TextureLibrary } from './textureLibrary.js';
 
 export class Editor {
@@ -32,6 +33,7 @@ export class Editor {
         this.camera = camera;
         this.renderer = renderer;
         this.assetManager = new AssetManager();
+        this.prefabManager = new PrefabManager(this.assetManager);
         this.textureLibrary = new TextureLibrary(renderer.gl, this.assetManager);
         this.undoStack = [];
         this.redoStack = [];
@@ -43,12 +45,22 @@ export class Editor {
             loadSubScene: (sceneId, data) => this.loadSubSceneData(sceneId, data),
             unloadSubScene: sceneId => this.unloadSubSceneData(sceneId)
         });
+        this.selectedMeshes = new Set();
 
         this.uiRoot = document.getElementById('ui-root');
         this.ui = createUI(this.uiRoot, {
             scene,
             gl: renderer.gl,
             textureLibrary: this.textureLibrary,
+            getSelectedItems: () => this.selectedMeshes,
+            prefabActions: {
+                list: () => this.prefabManager.list(),
+                create: name => this.createPrefab(name),
+                instantiate: id => this.instantiatePrefab(id),
+                update: id => this.updatePrefab(id),
+                revert: () => this.revertPrefabInstances(),
+                createNested: (name, ids) => this.createNestedPrefab(name, ids)
+            },
             sceneActions: {
                 list: () => this.sceneManager.list(),
                 activeId: () => this.sceneManager.activeSceneId,
@@ -64,7 +76,7 @@ export class Editor {
                 toggleSubScene: id => this.toggleSubScene(id),
                 subSceneState: id => this.getSubSceneState(id)
             },
-            onSelect: mesh => this.select(mesh),
+            onSelect: (mesh, additive) => this.select(mesh, { additive }),
             onSelectFace: faceIndex => this.selectFace(faceIndex),
             onSetPickMode: mode => this.gizmos.setPickMode(mode),
             onAddCube: () => this.addCube(),
@@ -270,6 +282,7 @@ export class Editor {
         this.ui.refreshLight();
         this.select(this.scene.meshes[0] || null);
         this.ui.refreshScenes();
+        this.ui.refreshPrefabs();
     }
 
     async loadSubSceneData(sceneId, data) {
@@ -388,6 +401,8 @@ export class Editor {
                 materialAsset.id,
                 skeletonAsset.id,
                 animationAsset?.id,
+                mesh.prefabInstance?.prefabId,
+                mesh.prefabInstance?.sourcePrefabId,
                 ...textureDependencies
             ].filter(Boolean))]);
             if (authoredMeshSet.has(mesh)) meshAssetIds.push(meshAsset.id);
@@ -409,11 +424,173 @@ export class Editor {
         this.ui.refreshTextures();
     }
 
-    select(mesh) {
-        this.selected = mesh;
+    select(mesh, { additive = false } = {}) {
+        if (additive && mesh) {
+            if (this.selectedMeshes.has(mesh)) this.selectedMeshes.delete(mesh);
+            else this.selectedMeshes.add(mesh);
+            if (this.selected === mesh) this.selected = [...this.selectedMeshes].at(-1) || null;
+            else if (this.selectedMeshes.has(mesh)) this.selected = mesh;
+        } else {
+            this.selectedMeshes.clear();
+            if (mesh) this.selectedMeshes.add(mesh);
+            this.selected = mesh;
+        }
         if (mesh) mesh.selectedFace = mesh.selectedFace < 0 ? 0 : mesh.selectedFace;
-        this.ui.setSelected(mesh);
+        this.ui.setSelected(this.selected);
         this.ui.refreshHierarchy();
+    }
+
+    selectMeshes(meshes) {
+        this.selectedMeshes.clear();
+        meshes.forEach(mesh => this.selectedMeshes.add(mesh));
+        this.selected = meshes.at(-1) || null;
+        this.ui.setSelected(this.selected);
+        this.ui.refreshHierarchy();
+    }
+
+    async createPrefab(name) {
+        const selectedMeshes = [...this.selectedMeshes].filter(mesh => this.scene.meshes.includes(mesh));
+        if (!selectedMeshes.length) throw new Error('Select one or more meshes to create a prefab');
+        this.refreshSceneAssets();
+        const sceneData = await this.serializeSceneData();
+        const meshDataByAssetId = new Map(sceneData.meshes.map(meshData => [meshData.assetId, meshData]));
+        const sourcePrefabIds = new Set(selectedMeshes.map(mesh => mesh.prefabInstance?.sourcePrefabId).filter(Boolean));
+        const keepSourceNodeIds = sourcePrefabIds.size === 1;
+        const nodeIds = new Map(selectedMeshes.map(mesh => [
+            mesh,
+            keepSourceNodeIds ? mesh.prefabInstance?.sourceNodeId || createId('prefab-node') : createId('prefab-node')
+        ]));
+        const nodes = selectedMeshes.map(mesh => {
+            const data = { ...meshDataByAssetId.get(mesh.assetId) };
+            delete data.prefabInstance;
+            const sourceInstance = mesh.prefabInstance;
+            const parentMesh = sourceInstance && selectedMeshes.find(candidate =>
+                candidate.prefabInstance?.instanceId === sourceInstance.instanceId && candidate.prefabInstance.nodeId === sourceInstance.parentNodeId
+            );
+            return {
+                id: nodeIds.get(mesh),
+                name: mesh.name,
+                parentId: parentMesh ? nodeIds.get(parentMesh) : null,
+                data
+            };
+        });
+        const prefab = this.prefabManager.create(name || `${selectedMeshes[0].name || 'Mesh'} Prefab`, nodes);
+        this.ui.refreshPrefabs();
+        return prefab;
+    }
+
+    async instantiatePrefab(prefabId) {
+        const instance = this.prefabManager.instantiate(prefabId);
+        this.recordHistory();
+        const meshData = instance.members.map(node => ({
+            ...node.data,
+            prefabInstance: {
+                instanceId: instance.instanceId,
+                prefabId: instance.prefabId,
+                sourcePrefabId: node.sourcePrefabId,
+                sourceNodeId: node.sourceNodeId,
+                nodeId: node.id,
+                parentNodeId: node.parentId,
+                overrides: {}
+            }
+        }));
+        const imported = await this.importSceneData({ meshes: meshData }, { selectImported: false });
+        this.selectMeshes(imported);
+        this.refreshSceneAssets();
+        this.ui.refreshPrefabs();
+        return imported;
+    }
+
+    async updatePrefab(prefabId) {
+        const selected = [...this.selectedMeshes].filter(mesh => mesh.prefabInstance?.sourcePrefabId === prefabId);
+        if (!selected.length) throw new Error('Select an instance node from the prefab being updated');
+        const instanceId = selected[0].prefabInstance.instanceId;
+        const instanceNodes = selected.filter(mesh => mesh.prefabInstance.instanceId === instanceId);
+        const sceneData = await this.serializeSceneData();
+        const dataByAssetId = new Map(sceneData.meshes.map(meshData => [meshData.assetId, meshData]));
+        const prefab = this.prefabManager.get(prefabId);
+        const nodes = prefab.data.nodes.map(node => {
+            const mesh = instanceNodes.find(candidate => candidate.prefabInstance.sourceNodeId === node.id && candidate.prefabInstance.sourcePrefabId === prefabId);
+            if (!mesh) return node;
+            const data = { ...dataByAssetId.get(mesh.assetId) };
+            delete data.prefabInstance;
+            mesh.prefabInstance.overrides = {};
+            return { ...node, data };
+        });
+        this.prefabManager.update(prefabId, nodes);
+        const updatedPrefabAsset = this.assetManager.toJSON().assets.find(asset => asset.id === prefabId);
+        const reconcileMeshData = meshData => {
+            const instance = meshData.prefabInstance;
+            if (!instance || instance.sourcePrefabId !== prefabId) return;
+            const baseData = this.prefabManager.revertNode(prefabId, instance.sourceNodeId);
+            const overrides = instance.instanceId === instanceId ? {} : instance.overrides || {};
+            const updatedData = this.prefabManager.applyOverrides(baseData, overrides);
+            const assetIds = Object.fromEntries(['assetId', 'materialAssetId', 'skeletonAssetId', 'animationAssetId'].map(key => [key, meshData[key]]));
+            Object.assign(meshData, updatedData, assetIds, { prefabInstance: { ...instance, overrides } });
+        };
+        for (const record of this.sceneManager.scenes.values()) {
+            (record.data.meshes || []).forEach(reconcileMeshData);
+            if (record.data.assetManifest?.assets && updatedPrefabAsset) {
+                const index = record.data.assetManifest.assets.findIndex(asset => asset.id === prefabId);
+                if (index >= 0) record.data.assetManifest.assets[index] = JSON.parse(JSON.stringify(updatedPrefabAsset));
+            }
+            record.updatedAt = Date.now();
+        }
+        const replacements = [];
+        for (const mesh of this.scene.meshes) {
+            const instance = mesh.prefabInstance;
+            if (!instance || instance.sourcePrefabId !== prefabId || instance.instanceId === instanceId) continue;
+            const currentData = dataByAssetId.get(mesh.assetId);
+            if (!currentData) continue;
+            const baseData = this.prefabManager.revertNode(prefabId, instance.sourceNodeId);
+            const overrides = currentData.prefabInstance?.overrides || instance.overrides || {};
+            const updatedData = this.prefabManager.applyOverrides(baseData, overrides);
+            for (const field of ['assetId', 'materialAssetId', 'skeletonAssetId', 'animationAssetId']) updatedData[field] = currentData[field];
+            updatedData.prefabInstance = { ...instance, overrides };
+            replacements.push([mesh, updatedData]);
+        }
+        for (const [mesh, data] of replacements) await this.replaceMeshFromPrefabData(mesh, data);
+        this.sceneManager.persist();
+        this.refreshSceneAssets();
+        this.ui.refreshPrefabs();
+        return prefab;
+    }
+
+    createNestedPrefab(name, prefabIds) {
+        const prefab = this.prefabManager.createNested(name, prefabIds);
+        this.ui.refreshPrefabs();
+        return prefab;
+    }
+
+    async revertPrefabInstances() {
+        const selected = [...this.selectedMeshes].filter(mesh => mesh.prefabInstance);
+        if (!selected.length) throw new Error('Select one or more prefab instance meshes to revert');
+        this.recordHistory();
+        const replacements = [];
+        for (const mesh of selected) {
+            const instance = mesh.prefabInstance;
+            const baseData = this.prefabManager.revertNode(instance.sourcePrefabId, instance.sourceNodeId);
+            const replacement = await this.replaceMeshFromPrefabData(mesh, {
+                ...baseData,
+                prefabInstance: { ...instance, overrides: {} }
+            });
+            replacements.push(replacement);
+        }
+        this.selectMeshes(replacements);
+        this.refreshSceneAssets();
+        this.ui.refreshPrefabs();
+        return replacements;
+    }
+
+    async replaceMeshFromPrefabData(mesh, data) {
+        const index = this.scene.meshes.indexOf(mesh);
+        const [replacement] = await this.importSceneData({ meshes: [data] }, { refreshAssets: false, selectImported: false });
+        if (!replacement || index < 0) throw new Error('Could not restore prefab mesh data');
+        this.scene.meshes[index] = replacement;
+        for (const members of this.streamedSubScenes.values()) {
+            if (members.delete(mesh)) members.add(replacement);
+        }
+        return replacement;
     }
 
     selectFace(faceIndex) {
@@ -623,6 +800,7 @@ export class Editor {
                 mesh.polygons = faces.map(face => face.map(index => [...vertices[index]]));
             }
             mesh.name = meshData.name || 'Imported Mesh';
+            mesh.prefabInstance = meshData.prefabInstance ? JSON.parse(JSON.stringify(meshData.prefabInstance)) : null;
             mesh.assetId = assetIds.get(meshData.assetId) || meshData.assetId || null;
             mesh.material.assetId = assetIds.get(meshData.materialAssetId) || meshData.materialAssetId || null;
             mesh.skeleton.assetId = assetIds.get(meshData.skeletonAssetId) || meshData.skeletonAssetId || null;
@@ -697,6 +875,7 @@ export class Editor {
         }
         if (refreshAssets) this.refreshSceneAssets();
         this.ui.refreshTextures();
+        this.ui.refreshPrefabs();
         if (selectImported && importedMeshes.length) this.select(importedMeshes[importedMeshes.length - 1]);
         return importedMeshes;
     }
@@ -861,6 +1040,7 @@ export class Editor {
                 materialAssetId: mesh.material.assetId,
                 skeletonAssetId: mesh.skeleton.assetId,
                 animationAssetId: mesh.animationClip?.assetId || null,
+                prefabInstance: mesh.prefabInstance ? JSON.parse(JSON.stringify(mesh.prefabInstance)) : null,
                 name: mesh.name,
                 position: mesh.position,
                 rotation: mesh.rotation,
@@ -952,6 +1132,7 @@ export class Editor {
 
     async serializeSceneData() {
         this.refreshSceneAssets();
+        const authoredMeshes = this.getAuthoredMeshes();
         const activeRecord = this.sceneManager?.activeScene;
         const allAssets = this.assetManager.toJSON();
         const assetsById = new Map(allAssets.assets.map(asset => [asset.id, asset]));
@@ -987,11 +1168,12 @@ export class Editor {
                 shadeColor: this.scene.light.shadeColor
             } : null,
             textureAssets: (await this.textureLibrary.getExportData()).filter(asset => reachableAssets.has(asset.id)),
-            meshes: this.getAuthoredMeshes().map(mesh => ({
+            meshes: authoredMeshes.map(mesh => ({
                 assetId: mesh.assetId,
                 materialAssetId: mesh.material.assetId,
                 skeletonAssetId: mesh.skeleton.assetId,
                 animationAssetId: mesh.animationClip?.assetId || null,
+                prefabInstance: mesh.prefabInstance ? JSON.parse(JSON.stringify(mesh.prefabInstance)) : null,
                 name: mesh.name,
                 position: mesh.position,
                 rotation: mesh.rotation,
@@ -1028,6 +1210,20 @@ export class Editor {
                 }))
             }))
         };
+        data.meshes.forEach((meshData, index) => {
+            const mesh = authoredMeshes[index];
+            if (!mesh.prefabInstance) return;
+            try {
+                mesh.prefabInstance.overrides = this.prefabManager.captureOverrides(
+                    mesh.prefabInstance.sourcePrefabId,
+                    mesh.prefabInstance.sourceNodeId,
+                    meshData
+                );
+            } catch {
+                mesh.prefabInstance.overrides = {};
+            }
+            meshData.prefabInstance = JSON.parse(JSON.stringify(mesh.prefabInstance));
+        });
         return data;
     }
 
@@ -1340,7 +1536,7 @@ function isTextInput(element) {
 }
 
 ===== FILE: editor/panels/assets.js =====
-export function createAssetsPanel(textureLibrary, onImportMesh, onImportTexture) {
+export function createAssetsPanel(textureLibrary, onImportMesh, onImportTexture, prefabActions = {}) {
     const panel = document.createElement('div');
     panel.className = 'editor-panel';
 
@@ -1353,6 +1549,75 @@ export function createAssetsPanel(textureLibrary, onImportMesh, onImportTexture)
     info.className = 'asset-info';
     info.textContent = 'Textures and model assets';
     panel.appendChild(info);
+
+    const prefabTitle = document.createElement('div');
+    prefabTitle.className = 'panel-title asset-section-title';
+    prefabTitle.textContent = 'Prefabs';
+    panel.appendChild(prefabTitle);
+
+    const prefabList = document.createElement('select');
+    prefabList.className = 'editor-input';
+    prefabList.multiple = true;
+    prefabList.size = 4;
+    prefabList.setAttribute('aria-label', 'Prefab assets');
+    panel.appendChild(prefabList);
+
+    const prefabName = document.createElement('input');
+    prefabName.className = 'editor-input field-group';
+    prefabName.type = 'text';
+    prefabName.placeholder = 'Prefab name';
+    prefabName.setAttribute('aria-label', 'Prefab name');
+    panel.appendChild(prefabName);
+
+    const prefabActionsElement = document.createElement('div');
+    prefabActionsElement.className = 'asset-list';
+    panel.appendChild(prefabActionsElement);
+    const prefabStatus = document.createElement('output');
+    prefabStatus.className = 'asset-info';
+    panel.appendChild(prefabStatus);
+
+    const selectedPrefabIds = () => [...prefabList.selectedOptions].map(option => option.value);
+    const runPrefabAction = async (action, success) => {
+        try {
+            await action();
+            prefabStatus.textContent = success;
+        } catch (error) {
+            prefabStatus.textContent = `Prefab operation failed: ${error.message || error}`;
+        }
+        refreshPrefabs();
+    };
+    const addPrefabButton = (label, callback, success) => {
+        const button = document.createElement('button');
+        button.className = 'editor-button';
+        button.type = 'button';
+        button.textContent = label;
+        button.addEventListener('click', () => runPrefabAction(callback, success));
+        prefabActionsElement.appendChild(button);
+        return button;
+    };
+    addPrefabButton('Create from selection', () => prefabActions.create?.(prefabName.value), 'Prefab created');
+    const instantiateButton = addPrefabButton('Instantiate', () => prefabActions.instantiate?.(selectedPrefabIds()[0]), 'Prefab instantiated');
+    const updateButton = addPrefabButton('Update Prefab', () => prefabActions.update?.(selectedPrefabIds()[0]), 'Prefab updated');
+    addPrefabButton('Revert Instance', () => prefabActions.revert?.(), 'Prefab instance reverted');
+    const nestedButton = addPrefabButton('Compose Nested', () => prefabActions.createNested?.(prefabName.value, selectedPrefabIds()), 'Nested prefab created');
+
+    function refreshPrefabs() {
+        const previousSelection = new Set(selectedPrefabIds());
+        prefabList.innerHTML = '';
+        const prefabs = prefabActions.list?.() || [];
+        prefabs.forEach(prefab => {
+            const option = document.createElement('option');
+            option.value = prefab.id;
+            option.textContent = prefab.name;
+            option.title = `${prefab.id} (${prefab.data?.nodes?.length || 0} nodes)`;
+            option.selected = previousSelection.has(prefab.id);
+            prefabList.appendChild(option);
+        });
+        instantiateButton.disabled = !prefabs.length;
+        updateButton.disabled = !prefabs.length;
+        nestedButton.disabled = selectedPrefabIds().length === 0;
+        if (!prefabs.length && !prefabStatus.textContent) prefabStatus.textContent = 'No prefabs yet.';
+    }
 
     const importLabel = document.createElement('label');
     importLabel.className = 'editor-button';
@@ -1394,6 +1659,7 @@ export function createAssetsPanel(textureLibrary, onImportMesh, onImportTexture)
         textureList.innerHTML = '';
         if (!textureLibrary.assets.length) {
             textureList.textContent = 'No images loaded.';
+            refreshPrefabs();
             return;
         }
         textureLibrary.assets.forEach(asset => {
@@ -1402,10 +1668,11 @@ export function createAssetsPanel(textureLibrary, onImportMesh, onImportTexture)
             item.textContent = asset.name;
             textureList.appendChild(item);
         });
+        refreshPrefabs();
     }
     refresh();
 
-    return { element: panel, refresh };
+    return { element: panel, refresh, refreshPrefabs };
 }
 
 ===== FILE: editor/panels/bones.js =====
@@ -1842,7 +2109,7 @@ export function createBonesPanel({ onAddBone, onRemoveBone, onCreateAnimation, o
 }
 
 ===== FILE: editor/panels/hierarchy.js =====
-export function createHierarchyPanel(scene, { onSelect, onDelete, onReorder, getSelected }) {
+export function createHierarchyPanel(scene, { onSelect, onDelete, onReorder, getSelected, getSelectedItems = () => [] }) {
     const panel = document.createElement('div');
     panel.className = 'editor-panel';
 
@@ -1859,14 +2126,16 @@ export function createHierarchyPanel(scene, { onSelect, onDelete, onReorder, get
         list.innerHTML = '';
         scene.meshes.forEach((mesh, i) => {
             const li = document.createElement('li');
-            li.className = 'hierarchy-item' + (mesh === getSelected() ? ' selected' : '');
+            const selectedItems = getSelectedItems();
+            const isSelected = selectedItems instanceof Set ? selectedItems.has(mesh) : selectedItems.includes(mesh);
+            li.className = 'hierarchy-item' + (mesh === getSelected() || isSelected ? ' selected' : '');
             li.draggable = true;
             li.dataset.meshIndex = String(i);
             const name = document.createElement('button');
             name.className = 'hierarchy-select';
             name.type = 'button';
             name.textContent = mesh.name || 'Mesh ' + i;
-            name.addEventListener('click', () => onSelect(mesh));
+            name.addEventListener('click', event => onSelect(mesh, event.ctrlKey || event.metaKey));
             const remove = document.createElement('button');
             remove.className = 'hierarchy-delete';
             remove.type = 'button';
@@ -3089,10 +3358,11 @@ export function createUI(root, options) {
         onSelect,
         onDelete,
         onReorder: onReorderMesh,
-        getSelected: () => selectedMesh
+        getSelected: () => selectedMesh,
+        getSelectedItems: () => options.getSelectedItems?.() || []
     });
     const inspector = createInspectorPanel(options.gl, options.textureLibrary, onSelectFace, onHistory);
-    const assets = createAssetsPanel(options.textureLibrary, onImportMesh, onImportTexture);
+    const assets = createAssetsPanel(options.textureLibrary, onImportMesh, onImportTexture, options.prefabActions);
     const bones = createBonesPanel({ onAddBone, onRemoveBone, onCreateAnimation, onKeyPose, onDeleteBoneKeys, onSeekAnimation, onToggleAnimation, onRenameAnimation, onSetAnimationDuration, onHistory });
     if (!scene.light) scene.light = new DirectionalLight();
     const lighting = createLightingPanel(scene.light, onHistory);
@@ -3275,6 +3545,7 @@ export function createUI(root, options) {
         setInternalFps: (fps, frameMs) => { fpsReadout.textContent = `Internal FPS ${Math.round(fps)} | ${frameMs.toFixed(2)} ms`; },
         setPolygonCount: (current, total) => { polygonReadout.textContent = `Current Mesh Polygons / All Polygons: ${current} / ${total}`; },
         refreshTextures: () => { assets.refresh(); inspector.refresh(); refreshUvTextures(); },
+        refreshPrefabs: assets.refreshPrefabs,
         refreshScenes,
         refreshLight: lighting.refresh,
         updateUvWorkspace: drawUvWorkspace,
@@ -4747,6 +5018,202 @@ function stitchFaceEdges(edges) {
     return currentKey === startKey && remaining.length === 0 ? { vertices, uvs } : null;
 }
 
+===== FILE: engine/prefabManager.js =====
+export class PrefabManager {
+    constructor(assetManager) {
+        if (!assetManager) throw new TypeError('PrefabManager requires an AssetManager');
+        this.assetManager = assetManager;
+    }
+
+    list() {
+        return this.assetManager.getByType('prefab');
+    }
+
+    get(id) {
+        const asset = this.assetManager.get(id);
+        return asset?.type === 'prefab' ? asset : null;
+    }
+
+    create(name, nodes, { id = null } = {}) {
+        const prefabNodes = normalizeNodes(nodes);
+        this.validateNestedPrefabs(prefabNodes, id);
+        const dependencies = this.getDependencies(prefabNodes);
+        const asset = this.assetManager.register({
+            id,
+            type: 'prefab',
+            name: String(name || 'Prefab').trim() || 'Prefab',
+            metadata: { nodeCount: prefabNodes.length, schemaVersion: 1 },
+            data: { schemaVersion: 1, nodes: prefabNodes }
+        });
+        this.assetManager.setDependencies(asset.id, dependencies);
+        return asset;
+    }
+
+    update(id, nodes) {
+        const asset = this.get(id);
+        if (!asset) throw new Error(`Unknown prefab: ${id}`);
+        const prefabNodes = normalizeNodes(nodes);
+        this.validateNestedPrefabs(prefabNodes, id);
+        const dependencies = this.getDependencies(prefabNodes);
+        asset.data = { schemaVersion: 1, nodes: prefabNodes };
+        asset.metadata = { ...asset.metadata, nodeCount: prefabNodes.length, schemaVersion: 1 };
+        this.assetManager.setDependencies(id, dependencies);
+        return asset;
+    }
+
+    createNested(name, prefabIds) {
+        if (!Array.isArray(prefabIds) || !prefabIds.length) throw new TypeError('At least one nested prefab is required');
+        const nodes = prefabIds.map((prefabId, index) => {
+            if (!this.get(prefabId)) throw new Error(`Unknown nested prefab: ${prefabId}`);
+            return {
+                id: createId('node'),
+                type: 'nestedPrefab',
+                name: this.get(prefabId).name,
+                parentId: null,
+                prefabId
+            };
+        });
+        return this.create(name, nodes);
+    }
+
+    instantiate(id, { instanceId = createId('instance') } = {}) {
+        if (!this.get(id)) throw new Error(`Unknown prefab: ${id}`);
+        const members = [];
+        const hierarchy = [];
+        this.expand(id, '', null, [], members, hierarchy);
+        return { instanceId, prefabId: id, members, hierarchy };
+    }
+
+    expand(prefabId, prefix, parentId, ancestry, members, hierarchy) {
+        if (ancestry.includes(prefabId)) throw new Error(`Prefab nesting cycle: ${[...ancestry, prefabId].join(' -> ')}`);
+        const prefab = this.get(prefabId);
+        if (!prefab) throw new Error(`Unknown nested prefab: ${prefabId}`);
+        const nextAncestry = [...ancestry, prefabId];
+        for (const node of prefab.data?.nodes || []) {
+            const instanceNodeId = `${prefix}${node.id}`;
+            const resolvedParentId = node.parentId ? `${prefix}${node.parentId}` : parentId;
+            if (node.type === 'nestedPrefab') {
+                hierarchy.push({
+                    id: instanceNodeId,
+                    name: node.name || this.get(node.prefabId)?.name || 'Nested Prefab',
+                    parentId: resolvedParentId,
+                    prefabId: node.prefabId,
+                    sourcePrefabId: prefabId,
+                    sourceNodeId: node.id
+                });
+                this.expand(node.prefabId, `${instanceNodeId}/`, instanceNodeId, nextAncestry, members, hierarchy);
+                continue;
+            }
+            members.push({
+                id: instanceNodeId,
+                name: node.name,
+                parentId: resolvedParentId,
+                sourcePrefabId: prefabId,
+                sourceNodeId: node.id,
+                data: cloneJson(node.data)
+            });
+        }
+    }
+
+    getNode(prefabId, nodeId) {
+        return this.get(prefabId)?.data?.nodes.find(node => node.id === nodeId) || null;
+    }
+
+    captureOverrides(prefabId, nodeId, currentData) {
+        const baseNode = this.getNode(prefabId, nodeId);
+        if (!baseNode) throw new Error(`Unknown prefab node: ${nodeId}`);
+        const overrides = {};
+        for (const [key, value] of Object.entries(currentData)) {
+            if (key === 'prefabInstance' || key === 'assetId' || key === 'materialAssetId' || key === 'skeletonAssetId' || key === 'animationAssetId') continue;
+            if (!sameValue(value, baseNode.data[key])) overrides[key] = cloneJson(value);
+        }
+        return overrides;
+    }
+
+    applyOverrides(nodeData, overrides = {}) {
+        return { ...cloneJson(nodeData), ...cloneJson(overrides) };
+    }
+
+    revertNode(prefabId, nodeId) {
+        const node = this.getNode(prefabId, nodeId);
+        if (!node || node.type === 'nestedPrefab') throw new Error(`Unknown prefab mesh node: ${nodeId}`);
+        return cloneJson(node.data);
+    }
+
+    getDependencies(nodes) {
+        const dependencies = new Set();
+        for (const node of nodes) {
+            if (node.prefabId) dependencies.add(node.prefabId);
+            for (const id of [node.data?.materialAssetId, node.data?.skeletonAssetId, node.data?.animationAssetId, node.data?.textureAssetId, ...(node.data?.faceTextureIds || [])]) {
+                if (id && this.assetManager.get(id)) dependencies.add(id);
+            }
+        }
+        return [...dependencies];
+    }
+
+    validateNestedPrefabs(nodes, updatingId = null) {
+        for (const node of nodes) {
+            if (!node.prefabId) continue;
+            if (!this.get(node.prefabId)) throw new Error(`Unknown nested prefab: ${node.prefabId}`);
+            if (node.prefabId === updatingId || this.reachesPrefab(node.prefabId, updatingId)) {
+                throw new Error('Prefab nesting cannot contain cycles');
+            }
+        }
+    }
+
+    reachesPrefab(fromId, targetId, visited = new Set()) {
+        if (!targetId) return false;
+        if (fromId === targetId) return true;
+        if (visited.has(fromId)) return false;
+        visited.add(fromId);
+        const prefab = this.get(fromId);
+        return !!prefab?.data?.nodes.some(node => node.prefabId && this.reachesPrefab(node.prefabId, targetId, visited));
+    }
+}
+
+function normalizeNodes(nodes) {
+    if (!Array.isArray(nodes) || !nodes.length) throw new TypeError('A prefab requires at least one node');
+    const ids = new Set();
+    const normalized = nodes.map(source => {
+        if (!source || typeof source !== 'object') throw new TypeError('Invalid prefab node');
+        const id = source.id || createId('node');
+        if (ids.has(id)) throw new Error(`Duplicate prefab node ID: ${id}`);
+        ids.add(id);
+        if (source.type === 'nestedPrefab') {
+            if (!source.prefabId) throw new TypeError('Nested prefab nodes require a prefab ID');
+            return { id, type: 'nestedPrefab', name: String(source.name || 'Nested Prefab'), parentId: source.parentId || null, prefabId: source.prefabId };
+        }
+        if (!source.data || typeof source.data !== 'object') throw new TypeError('Mesh prefab nodes require serialized mesh data');
+        return { id, type: 'mesh', name: String(source.name || source.data.name || 'Mesh'), parentId: source.parentId || null, data: cloneJson(source.data) };
+    });
+    const nodesById = new Map(normalized.map(node => [node.id, node]));
+    normalized.forEach(node => {
+        if (node.parentId && !ids.has(node.parentId)) throw new Error(`Unknown parent node: ${node.parentId}`);
+        if (node.parentId === node.id) throw new Error('A prefab node cannot parent itself');
+        const ancestors = new Set([node.id]);
+        let parentId = node.parentId;
+        while (parentId) {
+            if (ancestors.has(parentId)) throw new Error('Prefab node hierarchy cannot contain cycles');
+            ancestors.add(parentId);
+            parentId = nodesById.get(parentId)?.parentId || null;
+        }
+    });
+    return normalized;
+}
+
+function createId(type) {
+    const uuid = globalThis.crypto?.randomUUID?.();
+    return `${type}-${uuid || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`}`;
+}
+
+function cloneJson(value) {
+    return JSON.parse(JSON.stringify(value));
+}
+
+function sameValue(left, right) {
+    return JSON.stringify(left) === JSON.stringify(right);
+}
+
 ===== FILE: engine/raytracing.js =====
 export function traceDirectionalShadowFaces(scene, light) {
     const shadowedFaces = new Map(scene.meshes.map(mesh => [mesh, Array(mesh.faceCount).fill(false)]));
@@ -5518,12 +5985,24 @@ function duplicateSceneAssetIds(data) {
         manifest.assets.forEach(asset => {
             asset.id = ids.get(asset.id) || asset.id;
             asset.dependencies = (asset.dependencies || []).map(id => ids.get(id) || id);
+            for (const node of asset.data?.nodes || []) {
+                if (node.prefabId) node.prefabId = ids.get(node.prefabId) || node.prefabId;
+                if (!node.data) continue;
+                for (const field of ['assetId', 'materialAssetId', 'skeletonAssetId', 'animationAssetId', 'textureAssetId']) {
+                    if (node.data[field]) node.data[field] = ids.get(node.data[field]) || node.data[field];
+                }
+                node.data.faceTextureIds = (node.data.faceTextureIds || []).map(id => ids.get(id) || id);
+            }
         });
     }
     if (data.sceneAssetId) data.sceneAssetId = ids.get(data.sceneAssetId) || createId('scene');
     for (const mesh of data.meshes || []) {
         for (const field of ['assetId', 'materialAssetId', 'skeletonAssetId', 'animationAssetId']) {
             if (mesh[field]) mesh[field] = ids.get(mesh[field]) || createId(field.replace('AssetId', '').replace(/^[a-z]/, letter => letter.toLowerCase()));
+        }
+        if (mesh.prefabInstance) {
+            mesh.prefabInstance.prefabId = ids.get(mesh.prefabInstance.prefabId) || mesh.prefabInstance.prefabId;
+            mesh.prefabInstance.sourcePrefabId = ids.get(mesh.prefabInstance.sourcePrefabId) || mesh.prefabInstance.sourcePrefabId;
         }
     }
     return data.sceneAssetId || createId('scene');

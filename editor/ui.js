@@ -708,10 +708,11 @@ export function createUI(root, options) {
         onSelect,
         onDelete,
         onReorder: onReorderMesh,
-        getSelected: () => selectedMesh
+        getSelected: () => selectedMesh,
+        getSelectedItems: () => options.getSelectedItems?.() || []
     });
     const inspector = createInspectorPanel(options.gl, options.textureLibrary, onSelectFace, onHistory);
-    const assets = createAssetsPanel(options.textureLibrary, onImportMesh, onImportTexture);
+    const assets = createAssetsPanel(options.textureLibrary, onImportMesh, onImportTexture, options.prefabActions);
     const bones = createBonesPanel({ onAddBone, onRemoveBone, onCreateAnimation, onKeyPose, onDeleteBoneKeys, onSeekAnimation, onToggleAnimation, onRenameAnimation, onSetAnimationDuration, onHistory });
     if (!scene.light) scene.light = new DirectionalLight();
     const lighting = createLightingPanel(scene.light, onHistory);
@@ -894,6 +895,7 @@ export function createUI(root, options) {
         setInternalFps: (fps, frameMs) => { fpsReadout.textContent = `Internal FPS ${Math.round(fps)} | ${frameMs.toFixed(2)} ms`; },
         setPolygonCount: (current, total) => { polygonReadout.textContent = `Current Mesh Polygons / All Polygons: ${current} / ${total}`; },
         refreshTextures: () => { assets.refresh(); inspector.refresh(); refreshUvTextures(); },
+        refreshPrefabs: assets.refreshPrefabs,
         refreshScenes,
         refreshLight: lighting.refresh,
         updateUvWorkspace: drawUvWorkspace,

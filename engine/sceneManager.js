@@ -278,12 +278,24 @@ function duplicateSceneAssetIds(data) {
         manifest.assets.forEach(asset => {
             asset.id = ids.get(asset.id) || asset.id;
             asset.dependencies = (asset.dependencies || []).map(id => ids.get(id) || id);
+            for (const node of asset.data?.nodes || []) {
+                if (node.prefabId) node.prefabId = ids.get(node.prefabId) || node.prefabId;
+                if (!node.data) continue;
+                for (const field of ['assetId', 'materialAssetId', 'skeletonAssetId', 'animationAssetId', 'textureAssetId']) {
+                    if (node.data[field]) node.data[field] = ids.get(node.data[field]) || node.data[field];
+                }
+                node.data.faceTextureIds = (node.data.faceTextureIds || []).map(id => ids.get(id) || id);
+            }
         });
     }
     if (data.sceneAssetId) data.sceneAssetId = ids.get(data.sceneAssetId) || createId('scene');
     for (const mesh of data.meshes || []) {
         for (const field of ['assetId', 'materialAssetId', 'skeletonAssetId', 'animationAssetId']) {
             if (mesh[field]) mesh[field] = ids.get(mesh[field]) || createId(field.replace('AssetId', '').replace(/^[a-z]/, letter => letter.toLowerCase()));
+        }
+        if (mesh.prefabInstance) {
+            mesh.prefabInstance.prefabId = ids.get(mesh.prefabInstance.prefabId) || mesh.prefabInstance.prefabId;
+            mesh.prefabInstance.sourcePrefabId = ids.get(mesh.prefabInstance.sourcePrefabId) || mesh.prefabInstance.sourcePrefabId;
         }
     }
     return data.sceneAssetId || createId('scene');

@@ -344,12 +344,30 @@ export class Editor {
                 name: `${mesh.name || 'Mesh'} Material`,
                 type: 'material',
                 resource: mesh.material,
-                metadata: { shading: mesh.material.shading || 'toon' },
-                data: {
-                    color: [...mesh.material.color],
-                    useTexture: !!mesh.material.useTexture,
+                metadata: {
                     shading: mesh.material.shading || 'toon',
-                    textureAssetId: mesh.textureAssetId || null
+                    metallic: mesh.material.metallic,
+                    roughness: mesh.material.roughness,
+                    opacity: mesh.material.opacity
+                },
+                data: {
+                    name: mesh.material.name || `${mesh.name || 'Mesh'} Material`,
+                    assetId: mesh.material.assetId || null,
+                    baseColor: [...(mesh.material.baseColor || mesh.material.color || [1, 1, 1])],
+                    metallic: mesh.material.metallic ?? 0,
+                    roughness: mesh.material.roughness ?? 0.5,
+                    emission: [...(mesh.material.emission || [0, 0, 0])],
+                    opacity: mesh.material.opacity ?? 1,
+                    shading: mesh.material.shading || 'toon',
+                    useTexture: !!mesh.material.useTexture,
+                    textureAssetId: mesh.textureAssetId || null,
+                    textureSlots: {
+                        albedo: mesh.material.textureSlots?.albedo ? { id: mesh.material.textureSlots.albedo.id || null } : null,
+                        normal: mesh.material.textureSlots?.normal ? { id: mesh.material.textureSlots.normal.id || null } : null,
+                        roughness: mesh.material.textureSlots?.roughness ? { id: mesh.material.textureSlots.roughness.id || null } : null,
+                        metallic: mesh.material.textureSlots?.metallic ? { id: mesh.material.textureSlots.metallic.id || null } : null,
+                        emission: mesh.material.textureSlots?.emission ? { id: mesh.material.textureSlots.emission.id || null } : null
+                    }
                 }
             });
             mesh.material.assetId = materialAsset.id;
@@ -893,7 +911,22 @@ export class Editor {
         const resolveTexture = id => this.textureLibrary.get(textureIds.get(id) || assetIds.get(id) || id);
         const importedMeshes = [];
         for (const meshData of data.meshes || []) {
-            const mesh = new Mesh(new Material({ color: [...(meshData.color || [0.78, 0.84, 0.92])], shading: meshData.shading || 'toon' }));
+            const materialData = Material.fromJSON({
+                baseColor: meshData.baseColor || meshData.color || [0.78, 0.84, 0.92],
+                color: meshData.color || meshData.baseColor || [0.78, 0.84, 0.92],
+                metallic: meshData.metallic ?? 0,
+                roughness: meshData.roughness ?? 0.5,
+                emission: meshData.emission || [0, 0, 0],
+                opacity: meshData.opacity ?? 1,
+                shading: meshData.shading || 'toon',
+                useTexture: meshData.useTexture || !!meshData.textureAssetId,
+                texture: null,
+                albedo: null,
+                textureSlots: meshData.textureSlots || null,
+                assetId: meshData.materialAssetId || null,
+                name: meshData.materialName || 'Imported Material'
+            });
+            const mesh = new Mesh(materialData);
             if (meshData.polygons) {
                 mesh.polygons = meshData.polygons.map(polygon => polygon.map(vertex => [...vertex]));
             } else {
@@ -913,6 +946,7 @@ export class Editor {
             mesh.prefabInstance = meshData.prefabInstance ? JSON.parse(JSON.stringify(meshData.prefabInstance)) : null;
             mesh.assetId = assetIds.get(meshData.assetId) || meshData.assetId || null;
             mesh.material.assetId = assetIds.get(meshData.materialAssetId) || meshData.materialAssetId || null;
+            if (meshData.materialAssetId && !mesh.material.assetId) mesh.material.assetId = meshData.materialAssetId;
             mesh.skeleton.assetId = assetIds.get(meshData.skeletonAssetId) || meshData.skeletonAssetId || null;
             mesh.position = [...(meshData.position || [0, 0, 0])];
             mesh.rotation = [...(meshData.rotation || [0, 0, 0])];
@@ -964,9 +998,23 @@ export class Editor {
                 });
             }));
 
+            const resolveMaterialTexture = slot => {
+                if (!slot) return null;
+                const resolved = resolveTexture(slot); 
+                if (resolved?.texture) return resolved.texture;
+                return slot?.texture || slot || null;
+            };
+            const materialTextureSlots = meshData.textureSlots || {};
+            mesh.material.textureSlots = {
+                albedo: resolveMaterialTexture(materialTextureSlots.albedo ?? meshData.textureAssetId ?? null),
+                normal: resolveMaterialTexture(materialTextureSlots.normal ?? null),
+                roughness: resolveMaterialTexture(materialTextureSlots.roughness ?? null),
+                metallic: resolveMaterialTexture(materialTextureSlots.metallic ?? null),
+                emission: resolveMaterialTexture(materialTextureSlots.emission ?? null)
+            };
             mesh.textureAssetId = textureIds.get(meshData.textureAssetId) || assetIds.get(meshData.textureAssetId) || meshData.textureAssetId || null;
-            const meshTexture = resolveTexture(meshData.textureAssetId);
-            mesh.material.texture = meshTexture?.texture || null;
+            const meshTexture = resolveTexture(meshData.textureAssetId) || resolveMaterialTexture(materialTextureSlots.albedo ?? meshData.textureAssetId ?? null);
+            mesh.material.texture = meshTexture || null;
             mesh.material.useTexture = !!mesh.material.texture;
             mesh.faceTextureIds = (meshData.faceTextureIds || []).map(id => textureIds.get(id) || assetIds.get(id) || id || null);
             mesh.faceTextures = mesh.faceTextureIds.map(id => resolveTexture(id)?.texture || null);
@@ -1006,7 +1054,7 @@ export class Editor {
     }
 
     createPrimitive(type) {
-        const material = new Material({ color: [0.78, 0.84, 0.92] });
+        const material = Material.fromJSON({ baseColor: [0.78, 0.84, 0.92], color: [0.78, 0.84, 0.92], roughness: 0.5, metallic: 0, emission: [0, 0, 0], opacity: 1 });
         const creators = {
             Cube: () => Mesh.createCube(material),
             Plane: () => Mesh.createPlane(material),
@@ -1052,11 +1100,19 @@ export class Editor {
         const source = this.selected;
         if (!source) return;
         this.recordHistory();
-        const duplicate = new Mesh(new Material({
+        const duplicate = new Mesh(Material.fromJSON({
+            baseColor: [...source.material.baseColor],
             color: [...source.material.color],
+            opacity: source.material.opacity,
+            metallic: source.material.metallic,
+            roughness: source.material.roughness,
+            emission: [...source.material.emission],
             useTexture: source.material.useTexture,
             texture: source.material.texture,
-            shading: source.material.shading
+            shading: source.material.shading,
+            textureSlots: source.material.textureSlots,
+            assetId: source.material.assetId,
+            name: source.material.name
         }));
         duplicate.name = `${source.name} Copy`;
         duplicate.position = source.position.map((value, axis) => value + (axis === 0 ? 1 : 0));
@@ -1163,8 +1219,21 @@ export class Editor {
                 position: mesh.position,
                 rotation: mesh.rotation,
                 scale: mesh.scale,
+                materialName: mesh.material.name,
+                baseColor: [...mesh.material.baseColor],
                 color: mesh.material.color,
+                metallic: mesh.material.metallic,
+                roughness: mesh.material.roughness,
+                emission: [...mesh.material.emission],
+                opacity: mesh.material.opacity,
                 shading: mesh.material.shading,
+                textureSlots: {
+                    albedo: mesh.material.textureSlots?.albedo?.id || mesh.textureAssetId || null,
+                    normal: mesh.material.textureSlots?.normal?.id || null,
+                    roughness: mesh.material.textureSlots?.roughness?.id || null,
+                    metallic: mesh.material.textureSlots?.metallic?.id || null,
+                    emission: mesh.material.textureSlots?.emission?.id || null
+                },
                 polygons: mesh.polygons,
                 faceColors: mesh.faceColors,
                 textureAssetId: mesh.textureAssetId,

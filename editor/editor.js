@@ -4,6 +4,7 @@ import { Mesh } from '../engine/mesh.js';
 import { Material } from '../engine/material.js';
 import { AnimationClip } from '../engine/animation.js';
 import { DirectionalLight } from '../engine/light.js';
+import { AssetManager } from '../engine/assetManager.js';
 import { TextureLibrary } from './textureLibrary.js';
 
 export class Editor {
@@ -11,10 +12,12 @@ export class Editor {
         this.scene = scene;
         this.camera = camera;
         this.renderer = renderer;
-        this.textureLibrary = new TextureLibrary(renderer.gl);
+        this.assetManager = new AssetManager();
+        this.textureLibrary = new TextureLibrary(renderer.gl, this.assetManager);
         this.undoStack = [];
         this.redoStack = [];
         this.maxHistoryLength = 100;
+        this.refreshSceneAssets();
 
         this.uiRoot = document.getElementById('ui-root');
         this.ui = createUI(this.uiRoot, {
@@ -80,6 +83,105 @@ export class Editor {
         this.ui.updateAnimationWorkspace(this.selected?.animationPlayer.time || 0, this.selected?.animationPlayer.playing || false);
         const allPolygons = this.scene.meshes.reduce((sum, mesh) => sum + mesh.faceCount, 0);
         this.ui.setPolygonCount(this.selected?.faceCount || 0, allPolygons);
+    }
+
+    refreshSceneAssets() {
+        const sceneAsset = this.assetManager.register({
+            id: this.scene.assetId,
+            name: this.scene.name || 'Scene',
+            type: 'scene',
+            resource: this.scene,
+            metadata: { meshCount: this.scene.meshes.length }
+        });
+        this.scene.assetId = sceneAsset.id;
+
+        const meshAssetIds = [];
+        this.scene.meshes.forEach((mesh, index) => {
+            const materialAsset = this.assetManager.register({
+                id: mesh.material.assetId,
+                name: `${mesh.name || 'Mesh'} Material`,
+                type: 'material',
+                resource: mesh.material,
+                metadata: { shading: mesh.material.shading || 'toon' },
+                data: {
+                    color: [...mesh.material.color],
+                    useTexture: !!mesh.material.useTexture,
+                    shading: mesh.material.shading || 'toon',
+                    textureAssetId: mesh.textureAssetId || null
+                }
+            });
+            mesh.material.assetId = materialAsset.id;
+
+            const skeletonData = mesh.skeleton.bones.map(bone => ({
+                name: bone.name,
+                parent: bone.parent?.name || null,
+                position: [...bone.position],
+                rotation: [...bone.rotation],
+                scale: [...bone.scale],
+                length: bone.length,
+                bindPosition: [...bone.bindPosition],
+                bindRotation: [...bone.bindRotation],
+                bindScale: [...bone.bindScale]
+            }));
+            const skeletonAsset = this.assetManager.register({
+                id: mesh.skeleton.assetId,
+                name: `${mesh.name || 'Mesh'} Skeleton`,
+                type: 'skeleton',
+                resource: mesh.skeleton,
+                metadata: { boneCount: skeletonData.length },
+                data: { bones: skeletonData }
+            });
+            mesh.skeleton.assetId = skeletonAsset.id;
+
+            let animationAsset = null;
+            if (mesh.animationClip) {
+                const tracks = mesh.animationClip.tracks.map(track => ({
+                    boneName: track.boneName || null,
+                    property: track.property,
+                    times: [...track.times],
+                    values: track.values.map(value => Array.isArray(value) ? [...value] : value)
+                }));
+                animationAsset = this.assetManager.register({
+                    id: mesh.animationClip.assetId,
+                    name: mesh.animationClip.name || `${mesh.name || 'Mesh'} Animation`,
+                    type: 'animation',
+                    resource: mesh.animationClip,
+                    metadata: { duration: mesh.animationClip.duration, trackCount: tracks.length },
+                    data: { duration: mesh.animationClip.duration, tracks }
+                });
+                mesh.animationClip.assetId = animationAsset.id;
+            }
+
+            const meshAsset = this.assetManager.register({
+                id: mesh.assetId,
+                name: mesh.name || `Mesh ${index + 1}`,
+                type: 'mesh',
+                resource: mesh,
+                metadata: { polygonCount: mesh.faceCount },
+                data: { sceneIndex: index }
+            });
+            mesh.assetId = meshAsset.id;
+            const textureDependencies = [mesh.textureAssetId, ...(mesh.faceTextureIds || [])]
+                .filter(id => id && this.assetManager.get(id));
+            this.assetManager.setDependencies(materialAsset.id, [mesh.textureAssetId].filter(id => id && this.assetManager.get(id)));
+            this.assetManager.setDependencies(meshAsset.id, [...new Set([
+                materialAsset.id,
+                skeletonAsset.id,
+                animationAsset?.id,
+                ...textureDependencies
+            ].filter(Boolean))]);
+            meshAssetIds.push(meshAsset.id);
+        });
+
+        this.assetManager.register({
+            id: this.scene.assetId,
+            name: this.scene.name || 'Scene',
+            type: 'scene',
+            resource: this.scene,
+            metadata: { meshCount: meshAssetIds.length },
+            data: { meshAssetIds }
+        });
+        this.assetManager.setDependencies(sceneAsset.id, meshAssetIds);
     }
 
     async importTexture(file) {
@@ -248,10 +350,13 @@ export class Editor {
         mesh.name = file.name.replace(/\.[^.]+$/, '') || 'Imported Mesh';
         mesh.position = [0, 0.5, 0];
         this.scene.add(mesh);
+        this.refreshSceneAssets();
         this.select(mesh);
     }
 
     async importSceneData(data) {
+        const assetIds = data.assetManifest ? this.assetManager.importManifest(data.assetManifest) : new Map();
+        if (data.sceneAssetId) this.scene.assetId = assetIds.get(data.sceneAssetId) || data.sceneAssetId;
         if (data.light) {
             const importedLight = new DirectionalLight(data.light);
             if (this.scene.light) Object.assign(this.scene.light, importedLight);
@@ -260,7 +365,7 @@ export class Editor {
         }
         const textureIds = new Map();
         for (const assetData of data.textureAssets || []) {
-            const asset = await this.textureLibrary.importExportedAsset(assetData);
+            const asset = await this.textureLibrary.importExportedAsset(assetData, { id: assetIds.get(assetData.id) || assetData.id });
             textureIds.set(assetData.id, asset.id);
         }
         const resolveTexture = id => this.textureLibrary.get(textureIds.get(id) || id);
@@ -283,6 +388,9 @@ export class Editor {
                 mesh.polygons = faces.map(face => face.map(index => [...vertices[index]]));
             }
             mesh.name = meshData.name || 'Imported Mesh';
+            mesh.assetId = assetIds.get(meshData.assetId) || meshData.assetId || null;
+            mesh.material.assetId = assetIds.get(meshData.materialAssetId) || meshData.materialAssetId || null;
+            mesh.skeleton.assetId = assetIds.get(meshData.skeletonAssetId) || meshData.skeletonAssetId || null;
             mesh.position = [...(meshData.position || [0, 0, 0])];
             mesh.rotation = [...(meshData.rotation || [0, 0, 0])];
             mesh.scale = [...(meshData.scale || [1, 1, 1])];
@@ -342,6 +450,7 @@ export class Editor {
 
             if (meshData.animation) {
                 const clip = new AnimationClip(meshData.animation.name || 'Imported Animation', meshData.animation.duration || 1);
+                clip.assetId = assetIds.get(meshData.animationAssetId) || meshData.animationAssetId || null;
                 (meshData.animation.tracks || []).forEach(track => {
                     if (track.boneName) track.times.forEach((time, index) => clip.addBoneKeyframe(track.boneName, track.property, time, track.values[index]));
                     else clip.addTrack(track.property, [...track.times], track.values.map(value => [...value]));
@@ -351,6 +460,7 @@ export class Editor {
             this.scene.add(mesh);
             importedMeshes.push(mesh);
         }
+        this.refreshSceneAssets();
         this.ui.refreshTextures();
         if (importedMeshes.length) this.select(importedMeshes[importedMeshes.length - 1]);
     }
@@ -366,6 +476,7 @@ export class Editor {
         mesh.name = `${type} ${this.scene.meshes.length + 1}`;
         mesh.position = [0, 0.5, 0];
         this.scene.add(mesh);
+        this.refreshSceneAssets();
         this.select(mesh);
     }
 
@@ -408,6 +519,7 @@ export class Editor {
                 if (index + 1 < amount) await new Promise(resolve => setTimeout(resolve, 0));
             }
         }
+        this.refreshSceneAssets();
         this.select(lastMesh);
     }
 
@@ -467,6 +579,7 @@ export class Editor {
             else duplicate.animationClip.addTrack(track.property, [...track.times], track.values.map(value => [...value]));
         });
         this.scene.add(duplicate);
+        this.refreshSceneAssets();
         this.select(duplicate);
     }
 
@@ -476,6 +589,7 @@ export class Editor {
         if (index < 0) return;
         this.recordHistory();
         this.scene.remove(mesh);
+        this.refreshSceneAssets();
         if (mesh === this.selected) this.select(this.scene.meshes[Math.min(index, this.scene.meshes.length - 1)] || null);
         else this.ui.refreshHierarchy();
     }
@@ -593,10 +707,13 @@ export class Editor {
     }
 
     async exportScene() {
+        this.refreshSceneAssets();
         const data = {
             format: 'lightweight-3d-scene',
             version: 1,
             coordinateSystem: { handedness: 'right', upAxis: 'Y', units: 'editor' },
+            sceneAssetId: this.scene.assetId,
+            assetManifest: this.assetManager.toJSON(),
             light: this.scene.light ? {
                 name: this.scene.light.name,
                 direction: this.scene.light.direction,
@@ -607,6 +724,10 @@ export class Editor {
             } : null,
             textureAssets: await this.textureLibrary.getExportData(),
             meshes: this.scene.meshes.map(mesh => ({
+                assetId: mesh.assetId,
+                materialAssetId: mesh.material.assetId,
+                skeletonAssetId: mesh.skeleton.assetId,
+                animationAssetId: mesh.animationClip?.assetId || null,
                 name: mesh.name,
                 position: mesh.position,
                 rotation: mesh.rotation,

@@ -4,6 +4,7 @@ import { Mesh } from '../engine/mesh.js';
 import { Material } from '../engine/material.js';
 import { AnimationClip } from '../engine/animation.js';
 import { DirectionalLight } from '../engine/light.js';
+import { SceneManager } from '../engine/sceneManager.js';
 import { AssetManager } from '../engine/assetManager.js';
 import { TextureLibrary } from './textureLibrary.js';
 
@@ -17,13 +18,34 @@ export class Editor {
         this.undoStack = [];
         this.redoStack = [];
         this.maxHistoryLength = 100;
-        this.refreshSceneAssets();
+        this.streamedSubScenes = new Map();
+        this.sceneManager = new SceneManager({
+            serializeActive: () => this.serializeSceneData(),
+            activateScene: (data, record) => this.activateSceneData(data, record),
+            loadSubScene: (sceneId, data) => this.loadSubSceneData(sceneId, data),
+            unloadSubScene: sceneId => this.unloadSubSceneData(sceneId)
+        });
 
         this.uiRoot = document.getElementById('ui-root');
         this.ui = createUI(this.uiRoot, {
             scene,
             gl: renderer.gl,
             textureLibrary: this.textureLibrary,
+            sceneActions: {
+                list: () => this.sceneManager.list(),
+                activeId: () => this.sceneManager.activeSceneId,
+                create: () => this.createScene(),
+                save: () => this.saveScene(),
+                loadFile: file => this.loadSceneFile(file),
+                duplicate: () => this.duplicateScene(),
+                delete: () => this.deleteScene(),
+                switch: id => this.switchScene(id),
+                addReference: id => this.addSceneReference(id),
+                removeReference: id => this.removeSceneReference(id),
+                addSubScene: (id, streaming) => this.addSubScene(id, streaming),
+                toggleSubScene: id => this.toggleSubScene(id),
+                subSceneState: id => this.getSubSceneState(id)
+            },
             onSelect: mesh => this.select(mesh),
             onSelectFace: faceIndex => this.selectFace(faceIndex),
             onSetPickMode: mode => this.gizmos.setPickMode(mode),
@@ -85,17 +107,197 @@ export class Editor {
         this.ui.setPolygonCount(this.selected?.faceCount || 0, allPolygons);
     }
 
+    async initializeScenes() {
+        if (!this.sceneManager.activeScene) {
+            this.refreshSceneAssets();
+            const data = await this.serializeSceneData();
+            const record = await this.sceneManager.createScene(this.scene.name, data, { id: this.scene.assetId });
+            record.data.sceneAssetId = record.id;
+            this.scene.assetId = record.id;
+            this.sceneManager.persist();
+        } else {
+            await this.sceneManager.initializeActiveScene();
+        }
+        this.ui.refreshScenes();
+    }
+
+    async createScene() {
+        const sceneNumber = this.sceneManager.scenes.size + 1;
+        const record = await this.sceneManager.createScene(`Scene ${sceneNumber}`, {
+            format: 'lightweight-3d-scene',
+            version: 1,
+            coordinateSystem: { handedness: 'right', upAxis: 'Y', units: 'editor' },
+            sceneAssetId: null,
+            assetManifest: { version: 1, assets: [] },
+            light: null,
+            textureAssets: [],
+            meshes: []
+        });
+        record.data.sceneAssetId = record.id;
+        this.sceneManager.persist();
+        await this.sceneManager.loadScene(record.id);
+        this.ui.refreshScenes();
+        return record;
+    }
+
+    async saveScene() {
+        const record = await this.sceneManager.saveScene();
+        this.ui.refreshScenes();
+        return record;
+    }
+
+    async switchScene(id) {
+        const record = await this.sceneManager.loadScene(id);
+        this.ui.refreshScenes();
+        return record;
+    }
+
+    async duplicateScene() {
+        const record = await this.sceneManager.duplicateScene();
+        this.ui.refreshScenes();
+        return record;
+    }
+
+    async deleteScene() {
+        const removed = await this.sceneManager.deleteScene(this.sceneManager.activeSceneId);
+        this.ui.refreshScenes();
+        return removed;
+    }
+
+    async loadSceneFile(file) {
+        const data = JSON.parse(await file.text());
+        if (!data || !Array.isArray(data.meshes)) throw new TypeError('The selected file is not a scene export');
+        if (data.assetManifest) {
+            const assetIds = this.assetManager.importManifest(data.assetManifest);
+            this.remapImportedSceneAssetIds(data, assetIds);
+        }
+        const record = await this.sceneManager.createScene(data.sceneName || file.name.replace(/\.[^.]+$/, '') || 'Imported Scene', data);
+        record.references = (data.sceneReferences || []).filter(id => this.sceneManager.get(id));
+        record.subScenes = (data.subScenes || []).filter(entry => this.sceneManager.get(entry.sceneId)).map(entry => ({
+            sceneId: entry.sceneId,
+            streaming: entry.streaming !== false,
+            loaded: false
+        }));
+        this.sceneManager.persist();
+        await this.sceneManager.loadScene(record.id);
+        this.ui.refreshScenes();
+        return record;
+    }
+
+    remapImportedSceneAssetIds(data, assetIds) {
+        const remap = id => assetIds.get(id) || id;
+        data.sceneAssetId = remap(data.sceneAssetId);
+        data.assetManifest = {
+            ...data.assetManifest,
+            assets: data.assetManifest.assets.map(asset => ({
+                ...asset,
+                id: remap(asset.id),
+                dependencies: (asset.dependencies || []).map(remap),
+                data: asset.data?.textureAssetId ? { ...asset.data, textureAssetId: remap(asset.data.textureAssetId) } : asset.data
+            }))
+        };
+        (data.textureAssets || []).forEach(asset => { asset.id = remap(asset.id); });
+        (data.meshes || []).forEach(mesh => {
+            ['assetId', 'materialAssetId', 'skeletonAssetId', 'animationAssetId', 'textureAssetId'].forEach(field => {
+                if (mesh[field]) mesh[field] = remap(mesh[field]);
+            });
+            mesh.faceTextureIds = (mesh.faceTextureIds || []).map(remap);
+        });
+    }
+
+    async addSceneReference(id) {
+        const result = this.sceneManager.addReference(this.sceneManager.activeSceneId, id);
+        this.ui.refreshScenes();
+        return result;
+    }
+
+    removeSceneReference(id) {
+        const result = this.sceneManager.removeReference(this.sceneManager.activeSceneId, id);
+        this.ui.refreshScenes();
+        return result;
+    }
+
+    async addSubScene(id, streaming) {
+        const result = await this.sceneManager.addSubScene(this.sceneManager.activeSceneId, id, { streaming });
+        this.ui.refreshScenes();
+        return result;
+    }
+
+    async toggleSubScene(id) {
+        const link = this.getSubSceneState(id);
+        if (!link) return false;
+        const result = link.loaded
+            ? await this.sceneManager.unloadSubScene(this.sceneManager.activeSceneId, id)
+            : await this.sceneManager.loadSubScene(this.sceneManager.activeSceneId, id);
+        this.ui.refreshScenes();
+        return result;
+    }
+
+    getSubSceneState(id) {
+        return this.sceneManager.activeScene?.subScenes.find(entry => entry.sceneId === id) || null;
+    }
+
+    async activateSceneData(data, record) {
+        this.scene.meshes.length = 0;
+        this.streamedSubScenes.clear();
+        this.scene.name = record.name;
+        this.scene.assetId = record.id;
+        this.scene.light = null;
+        this.undoStack.length = 0;
+        this.redoStack.length = 0;
+        await this.importSceneData(data, { reuseExistingAssets: true, setSceneId: true });
+        this.scene.name = record.name;
+        this.scene.assetId = data.sceneAssetId || record.id;
+        if (!this.scene.light) this.scene.light = new DirectionalLight();
+        this.ui.refreshLight();
+        this.select(this.scene.meshes[0] || null);
+        this.ui.refreshScenes();
+    }
+
+    async loadSubSceneData(sceneId, data) {
+        if (this.streamedSubScenes.has(sceneId)) return false;
+        const imported = await this.importSceneData(data, {
+            reuseExistingAssets: true,
+            includeLighting: false,
+            setSceneId: false,
+            refreshAssets: false,
+            selectImported: false
+        });
+        this.streamedSubScenes.set(sceneId, new Set(imported));
+        this.refreshSceneAssets();
+        this.ui.refreshHierarchy();
+        return true;
+    }
+
+    async unloadSubSceneData(sceneId) {
+        const meshes = this.streamedSubScenes.get(sceneId);
+        if (!meshes) return false;
+        this.scene.meshes = this.scene.meshes.filter(mesh => !meshes.has(mesh));
+        this.streamedSubScenes.delete(sceneId);
+        if (meshes.has(this.selected)) this.select(this.getAuthoredMeshes().at(-1) || null);
+        this.refreshSceneAssets();
+        this.ui.refreshHierarchy();
+        return true;
+    }
+
+    getAuthoredMeshes() {
+        const streamed = new Set([...this.streamedSubScenes.values()].flatMap(meshes => [...meshes]));
+        return this.scene.meshes.filter(mesh => !streamed.has(mesh));
+    }
+
     refreshSceneAssets() {
+        const sceneMeshes = this.getAuthoredMeshes();
         const sceneAsset = this.assetManager.register({
             id: this.scene.assetId,
             name: this.scene.name || 'Scene',
             type: 'scene',
             resource: this.scene,
-            metadata: { meshCount: this.scene.meshes.length }
+            metadata: { meshCount: sceneMeshes.length }
         });
         this.scene.assetId = sceneAsset.id;
 
         const meshAssetIds = [];
+        const authoredMeshSet = new Set(sceneMeshes);
         this.scene.meshes.forEach((mesh, index) => {
             const materialAsset = this.assetManager.register({
                 id: mesh.material.assetId,
@@ -170,7 +372,7 @@ export class Editor {
                 animationAsset?.id,
                 ...textureDependencies
             ].filter(Boolean))]);
-            meshAssetIds.push(meshAsset.id);
+            if (authoredMeshSet.has(mesh)) meshAssetIds.push(meshAsset.id);
         });
 
         this.assetManager.register({
@@ -354,10 +556,23 @@ export class Editor {
         this.select(mesh);
     }
 
-    async importSceneData(data) {
-        const assetIds = data.assetManifest ? this.assetManager.importManifest(data.assetManifest) : new Map();
-        if (data.sceneAssetId) this.scene.assetId = assetIds.get(data.sceneAssetId) || data.sceneAssetId;
-        if (data.light) {
+    async importSceneData(data, { reuseExistingAssets = false, includeLighting = true, setSceneId = false, refreshAssets = true, selectImported = true } = {}) {
+        const assetIds = data.assetManifest ? this.assetManager.importManifest(data.assetManifest, { reuseExisting: reuseExistingAssets }) : new Map();
+        const reserveCollidingId = (id, type) => {
+            if (id && !assetIds.has(id) && this.assetManager.get(id)) assetIds.set(id, this.assetManager.createId(type));
+        };
+        if (!data.assetManifest && !reuseExistingAssets) {
+            if (setSceneId) reserveCollidingId(data.sceneAssetId, 'scene');
+            (data.textureAssets || []).forEach(asset => reserveCollidingId(asset.id, 'texture'));
+            (data.meshes || []).forEach(meshData => {
+                reserveCollidingId(meshData.assetId, 'mesh');
+                reserveCollidingId(meshData.materialAssetId, 'material');
+                reserveCollidingId(meshData.skeletonAssetId, 'skeleton');
+                reserveCollidingId(meshData.animationAssetId, 'animation');
+            });
+        }
+        if (setSceneId && data.sceneAssetId) this.scene.assetId = assetIds.get(data.sceneAssetId) || data.sceneAssetId;
+        if (includeLighting && data.light) {
             const importedLight = new DirectionalLight(data.light);
             if (this.scene.light) Object.assign(this.scene.light, importedLight);
             else this.scene.light = importedLight;
@@ -365,12 +580,14 @@ export class Editor {
         }
         const textureIds = new Map();
         for (const assetData of data.textureAssets || []) {
-            const asset = await this.textureLibrary.importExportedAsset(assetData, { id: assetIds.get(assetData.id) || assetData.id });
+            const textureId = assetIds.get(assetData.id) || assetData.id;
+            const existingTexture = reuseExistingAssets ? this.textureLibrary.get(textureId) : null;
+            const asset = existingTexture || await this.textureLibrary.importExportedAsset(assetData, { id: textureId });
             textureIds.set(assetData.id, asset.id);
         }
-        const resolveTexture = id => this.textureLibrary.get(textureIds.get(id) || id);
+        const resolveTexture = id => this.textureLibrary.get(textureIds.get(id) || assetIds.get(id) || id);
         const importedMeshes = [];
-        for (const meshData of data.meshes) {
+        for (const meshData of data.meshes || []) {
             const mesh = new Mesh(new Material({ color: [...(meshData.color || [0.78, 0.84, 0.92])], shading: meshData.shading || 'toon' }));
             if (meshData.polygons) {
                 mesh.polygons = meshData.polygons.map(polygon => polygon.map(vertex => [...vertex]));
@@ -441,11 +658,11 @@ export class Editor {
                 });
             }));
 
-            mesh.textureAssetId = textureIds.get(meshData.textureAssetId) || meshData.textureAssetId || null;
+            mesh.textureAssetId = textureIds.get(meshData.textureAssetId) || assetIds.get(meshData.textureAssetId) || meshData.textureAssetId || null;
             const meshTexture = resolveTexture(meshData.textureAssetId);
             mesh.material.texture = meshTexture?.texture || null;
             mesh.material.useTexture = !!mesh.material.texture;
-            mesh.faceTextureIds = (meshData.faceTextureIds || []).map(id => textureIds.get(id) || id || null);
+            mesh.faceTextureIds = (meshData.faceTextureIds || []).map(id => textureIds.get(id) || assetIds.get(id) || id || null);
             mesh.faceTextures = mesh.faceTextureIds.map(id => resolveTexture(id)?.texture || null);
 
             if (meshData.animation) {
@@ -460,9 +677,10 @@ export class Editor {
             this.scene.add(mesh);
             importedMeshes.push(mesh);
         }
-        this.refreshSceneAssets();
+        if (refreshAssets) this.refreshSceneAssets();
         this.ui.refreshTextures();
-        if (importedMeshes.length) this.select(importedMeshes[importedMeshes.length - 1]);
+        if (selectImported && importedMeshes.length) this.select(importedMeshes[importedMeshes.length - 1]);
+        return importedMeshes;
     }
 
     addCube() {
@@ -609,6 +827,7 @@ export class Editor {
     }
 
     snapshotScene() {
+        const authoredMeshes = this.getAuthoredMeshes();
         const snapshot = {
             light: this.scene.light ? {
                 name: this.scene.light.name,
@@ -618,8 +837,12 @@ export class Editor {
                 threshold: this.scene.light.threshold,
                 shadeColor: this.scene.light.shadeColor
             } : null,
-            selectedIndex: this.scene.meshes.indexOf(this.selected),
-            meshes: this.scene.meshes.map(mesh => ({
+            selectedIndex: authoredMeshes.indexOf(this.selected),
+            meshes: authoredMeshes.map(mesh => ({
+                assetId: mesh.assetId,
+                materialAssetId: mesh.material.assetId,
+                skeletonAssetId: mesh.skeleton.assetId,
+                animationAssetId: mesh.animationClip?.assetId || null,
                 name: mesh.name,
                 position: mesh.position,
                 rotation: mesh.rotation,
@@ -676,8 +899,10 @@ export class Editor {
     }
 
     async restoreHistorySnapshot(snapshot) {
+        const streamedMeshes = [...this.streamedSubScenes.values()].flatMap(meshes => [...meshes]);
         this.scene.meshes.length = 0;
-        await this.importSceneData(snapshot);
+        await this.importSceneData(snapshot, { reuseExistingAssets: true });
+        this.scene.meshes.push(...streamedMeshes);
         if (snapshot.light) {
             if (!this.scene.light) this.scene.light = new DirectionalLight(snapshot.light);
             else Object.assign(this.scene.light, new DirectionalLight(snapshot.light));
@@ -689,7 +914,8 @@ export class Editor {
             mesh.selectedVertex = meshData.selectedVertex || null;
             mesh.selectedBone = meshData.selectedBone ?? null;
         });
-        this.select(this.scene.meshes[snapshot.selectedIndex] || null);
+        this.refreshSceneAssets();
+        this.select(this.getAuthoredMeshes()[snapshot.selectedIndex] || null);
     }
 
     async undo() {
@@ -706,14 +932,34 @@ export class Editor {
         await this.restoreHistorySnapshot(snapshot);
     }
 
-    async exportScene() {
+    async serializeSceneData() {
         this.refreshSceneAssets();
+        const activeRecord = this.sceneManager?.activeScene;
+        const allAssets = this.assetManager.toJSON();
+        const assetsById = new Map(allAssets.assets.map(asset => [asset.id, asset]));
+        const reachableAssets = new Set([this.scene.assetId]);
+        const pendingAssetIds = [this.scene.assetId];
+        while (pendingAssetIds.length) {
+            const asset = assetsById.get(pendingAssetIds.pop());
+            for (const dependencyId of asset?.dependencies || []) {
+                if (reachableAssets.has(dependencyId)) continue;
+                reachableAssets.add(dependencyId);
+                pendingAssetIds.push(dependencyId);
+            }
+        }
+        const assetManifest = {
+            ...allAssets,
+            assets: allAssets.assets.filter(asset => reachableAssets.has(asset.id))
+        };
         const data = {
             format: 'lightweight-3d-scene',
             version: 1,
             coordinateSystem: { handedness: 'right', upAxis: 'Y', units: 'editor' },
+            sceneName: this.scene.name,
             sceneAssetId: this.scene.assetId,
-            assetManifest: this.assetManager.toJSON(),
+            sceneReferences: activeRecord ? [...activeRecord.references] : [],
+            subScenes: activeRecord ? activeRecord.subScenes.map(({ sceneId, streaming }) => ({ sceneId, streaming })) : [],
+            assetManifest,
             light: this.scene.light ? {
                 name: this.scene.light.name,
                 direction: this.scene.light.direction,
@@ -722,8 +968,8 @@ export class Editor {
                 threshold: this.scene.light.threshold,
                 shadeColor: this.scene.light.shadeColor
             } : null,
-            textureAssets: await this.textureLibrary.getExportData(),
-            meshes: this.scene.meshes.map(mesh => ({
+            textureAssets: (await this.textureLibrary.getExportData()).filter(asset => reachableAssets.has(asset.id)),
+            meshes: this.getAuthoredMeshes().map(mesh => ({
                 assetId: mesh.assetId,
                 materialAssetId: mesh.material.assetId,
                 skeletonAssetId: mesh.skeleton.assetId,
@@ -764,6 +1010,11 @@ export class Editor {
                 }))
             }))
         };
+        return data;
+    }
+
+    async exportScene() {
+        const data = await this.serializeSceneData();
         const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
         const link = document.createElement('a');
         link.href = URL.createObjectURL(blob);

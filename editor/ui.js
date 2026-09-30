@@ -7,6 +7,7 @@ import { DirectionalLight } from '../engine/light.js';
 
 export function createUI(root, options) {
     const { scene, onSelect, onSelectFace, onSetPickMode, onAddCube, onAddPlane, onAddSphere, onAddCylinder, onAddBatch, onDuplicate, onAddFace, onExtrudeFace, onMergeFace, onMergeVertices, onAddVertex, onAddBone, onRemoveBone, onCreateAnimation, onKeyPose, onDeleteBoneKeys, onSeekAnimation, onToggleAnimation, onRenameAnimation, onSetAnimationDuration, onImportMesh, onImportTexture, onDelete, onReorderMesh, onResetCamera, onExport, onUndo, onRedo, onHistory = () => {} } = options;
+    const sceneActions = options.sceneActions || {};
     root.style.pointerEvents = 'none';
     root.innerHTML = '';
     let saveCurrentLayout = () => {};
@@ -26,6 +27,10 @@ export function createUI(root, options) {
         .tool-group summary::before { content: '+'; display: inline-block; width: 18px; color: #ffd071; }
         .tool-group[open] summary::before { content: '-'; }
         .tool-group-content { display: flex; flex-wrap: wrap; gap: 5px; padding: 6px 0 2px; }
+        .scene-controls { display: grid; grid-template-columns: repeat(3, minmax(92px, 1fr)); gap: 5px; width: min(390px, 100%); }
+        .scene-controls .scene-wide { grid-column: 1 / -1; }
+        .scene-controls .check-row { grid-column: 1 / -1; margin: 0; }
+        .scene-status { grid-column: 1 / -1; min-height: 16px; color: #9aa9ba; font: 11px/1.3 ui-monospace, monospace; }
         .batch-create-controls { display: grid; grid-template-columns: minmax(100px, 1fr) 80px 80px auto; gap: 5px; align-items: center; width: 100%; }
         .batch-create-status { grid-column: 1 / -1; min-height: 16px; color: #9aa9ba; font: 11px/1.3 ui-monospace, monospace; }
         .editor-title { margin: 0 8px 0 4px; font-size: 13px; font-weight: 650; letter-spacing: 0; text-transform: uppercase; color: #e8edf5; white-space: nowrap; }
@@ -268,6 +273,113 @@ export function createUI(root, options) {
     group('View & Scene');
     button('Center View', onResetCamera);
     button('Export', onExport);
+    const sceneControls = document.createElement('div');
+    sceneControls.className = 'scene-controls';
+    activeToolGroup.appendChild(sceneControls);
+    const createSceneSelect = label => {
+        const select = document.createElement('select');
+        select.className = 'editor-input scene-wide';
+        select.setAttribute('aria-label', label);
+        sceneControls.appendChild(select);
+        return select;
+    };
+    const createSceneButton = (label, action, success) => {
+        const element = document.createElement('button');
+        element.className = 'editor-button';
+        element.type = 'button';
+        element.textContent = label;
+        element.addEventListener('click', () => runSceneAction(action, success));
+        sceneControls.appendChild(element);
+        return element;
+    };
+    const sceneSelect = createSceneSelect('Active scene');
+    const referenceTarget = createSceneSelect('Scene to reference');
+    const referenceSelect = createSceneSelect('Referenced scene');
+    const subSceneTarget = createSceneSelect('Sub-scene to load');
+    const sceneStatus = document.createElement('output');
+    sceneStatus.className = 'scene-status';
+    sceneControls.appendChild(sceneStatus);
+    const addReferenceButton = createSceneButton('Add Reference', () => sceneActions.addReference?.(referenceTarget.value), 'Scene reference added');
+    const removeReferenceButton = createSceneButton('Remove Reference', () => sceneActions.removeReference?.(referenceSelect.value), 'Scene reference removed');
+    const addSubSceneButton = createSceneButton('Add Sub-scene', () => sceneActions.addSubScene?.(subSceneTarget.value, streamingInput.checked), 'Sub-scene linked');
+    const streamSubSceneButton = createSceneButton('Load Sub-scene', () => sceneActions.toggleSubScene?.(subSceneTarget.value), 'Sub-scene state updated');
+    const newSceneButton = createSceneButton('New Scene', () => sceneActions.create?.(), 'Scene created');
+    const saveSceneButton = createSceneButton('Save Scene', () => sceneActions.save?.(), 'Scene saved');
+    const duplicateSceneButton = createSceneButton('Duplicate', () => sceneActions.duplicate?.(), 'Scene duplicated');
+    const deleteSceneButton = createSceneButton('Delete Scene', () => sceneActions.delete?.(), 'Scene deleted');
+    const streamingLabel = document.createElement('label');
+    streamingLabel.className = 'check-row';
+    const streamingInput = document.createElement('input');
+    streamingInput.type = 'checkbox';
+    streamingInput.checked = true;
+    streamingLabel.append(streamingInput, document.createTextNode('Stream on demand'));
+    sceneControls.appendChild(streamingLabel);
+    const loadSceneLabel = document.createElement('label');
+    loadSceneLabel.className = 'editor-button';
+    loadSceneLabel.textContent = 'Import Scene';
+    const loadSceneInput = document.createElement('input');
+    loadSceneInput.type = 'file';
+    loadSceneInput.accept = '.json,application/json';
+    loadSceneInput.hidden = true;
+    loadSceneInput.addEventListener('change', () => {
+        const file = loadSceneInput.files?.[0];
+        if (file) runSceneAction(() => sceneActions.loadFile?.(file), 'Scene imported');
+        loadSceneInput.value = '';
+    });
+    loadSceneLabel.appendChild(loadSceneInput);
+    sceneControls.appendChild(loadSceneLabel);
+    sceneSelect.addEventListener('change', () => runSceneAction(() => sceneActions.switch?.(sceneSelect.value), 'Scene switched'));
+
+    function refreshScenes() {
+        const records = sceneActions.list?.() || [];
+        const activeId = sceneActions.activeId?.() || '';
+        const activeRecord = records.find(record => record.id === activeId);
+        const fill = (select, entries, selectedId, placeholder) => {
+            select.innerHTML = '';
+            if (!entries.length) {
+                const empty = document.createElement('option');
+                empty.value = '';
+                empty.textContent = placeholder;
+                select.appendChild(empty);
+            }
+            entries.forEach(record => {
+                const option = document.createElement('option');
+                option.value = record.id;
+                option.textContent = record.name;
+                select.appendChild(option);
+            });
+            if (entries.some(record => record.id === selectedId)) select.value = selectedId;
+        };
+        fill(sceneSelect, records, activeId, 'No scenes');
+        fill(referenceTarget, records.filter(record => record.id !== activeId), referenceTarget.value, 'No other scenes');
+        const referencedRecords = (activeRecord?.references || []).map(id => records.find(record => record.id === id)).filter(Boolean);
+        fill(referenceSelect, referencedRecords, referenceSelect.value, 'No references');
+        const subSceneRecords = records.filter(record => record.id !== activeId);
+        fill(subSceneTarget, subSceneRecords, subSceneTarget.value, 'No available sub-scenes');
+        const subScene = sceneActions.subSceneState?.(subSceneTarget.value);
+        streamSubSceneButton.textContent = subScene?.loaded ? 'Unload Sub-scene' : 'Load Sub-scene';
+        streamSubSceneButton.disabled = !subScene;
+        addSubSceneButton.disabled = !subSceneTarget.value || !!subScene;
+        addReferenceButton.disabled = !referenceTarget.value || !!activeRecord?.references.includes(referenceTarget.value);
+        removeReferenceButton.disabled = !referenceSelect.value;
+        deleteSceneButton.disabled = records.length <= 1;
+        saveSceneButton.disabled = !activeId;
+        duplicateSceneButton.disabled = !activeId;
+    }
+
+    async function runSceneAction(action, success) {
+        try {
+            if (typeof action !== 'function') return;
+            await action();
+            sceneStatus.textContent = success;
+        } catch (error) {
+            sceneStatus.textContent = `Scene operation failed: ${error.message || error}`;
+        }
+        refreshScenes();
+    }
+
+    [referenceTarget, referenceSelect, subSceneTarget].forEach(select => select.addEventListener('change', refreshScenes));
+    refreshScenes();
     const uvWorkspace = document.createElement('div');
     uvWorkspace.className = 'uv-workspace';
     const uvTitle = document.createElement('h2');
@@ -782,6 +894,7 @@ export function createUI(root, options) {
         setInternalFps: (fps, frameMs) => { fpsReadout.textContent = `Internal FPS ${Math.round(fps)} | ${frameMs.toFixed(2)} ms`; },
         setPolygonCount: (current, total) => { polygonReadout.textContent = `Current Mesh Polygons / All Polygons: ${current} / ${total}`; },
         refreshTextures: () => { assets.refresh(); inspector.refresh(); refreshUvTextures(); },
+        refreshScenes,
         refreshLight: lighting.refresh,
         updateUvWorkspace: drawUvWorkspace,
         updateAnimationWorkspace: (time, playing) => bones.updatePlayback(time, playing),

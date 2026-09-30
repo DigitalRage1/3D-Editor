@@ -1,6 +1,9 @@
 /*PROJECT TEXT EXPORT
 Readable file contents are grouped by workspace-relative path. Binary assets are listed by path; their bytes are not embedded.
 
+===== FILE: README.md =====
+# 3D-Editor
+
 ===== FILE: assets/models/cube.json =====
 {
   "vertices": [],
@@ -19,6 +22,8 @@ import { Mesh } from '../engine/mesh.js';
 import { Material } from '../engine/material.js';
 import { AnimationClip } from '../engine/animation.js';
 import { DirectionalLight } from '../engine/light.js';
+import { SceneManager } from '../engine/sceneManager.js';
+import { AssetManager } from '../engine/assetManager.js';
 import { TextureLibrary } from './textureLibrary.js';
 
 export class Editor {
@@ -26,16 +31,39 @@ export class Editor {
         this.scene = scene;
         this.camera = camera;
         this.renderer = renderer;
-        this.textureLibrary = new TextureLibrary(renderer.gl);
+        this.assetManager = new AssetManager();
+        this.textureLibrary = new TextureLibrary(renderer.gl, this.assetManager);
         this.undoStack = [];
         this.redoStack = [];
         this.maxHistoryLength = 100;
+        this.streamedSubScenes = new Map();
+        this.sceneManager = new SceneManager({
+            serializeActive: () => this.serializeSceneData(),
+            activateScene: (data, record) => this.activateSceneData(data, record),
+            loadSubScene: (sceneId, data) => this.loadSubSceneData(sceneId, data),
+            unloadSubScene: sceneId => this.unloadSubSceneData(sceneId)
+        });
 
         this.uiRoot = document.getElementById('ui-root');
         this.ui = createUI(this.uiRoot, {
             scene,
             gl: renderer.gl,
             textureLibrary: this.textureLibrary,
+            sceneActions: {
+                list: () => this.sceneManager.list(),
+                activeId: () => this.sceneManager.activeSceneId,
+                create: () => this.createScene(),
+                save: () => this.saveScene(),
+                loadFile: file => this.loadSceneFile(file),
+                duplicate: () => this.duplicateScene(),
+                delete: () => this.deleteScene(),
+                switch: id => this.switchScene(id),
+                addReference: id => this.addSceneReference(id),
+                removeReference: id => this.removeSceneReference(id),
+                addSubScene: (id, streaming) => this.addSubScene(id, streaming),
+                toggleSubScene: id => this.toggleSubScene(id),
+                subSceneState: id => this.getSubSceneState(id)
+            },
             onSelect: mesh => this.select(mesh),
             onSelectFace: faceIndex => this.selectFace(faceIndex),
             onSetPickMode: mode => this.gizmos.setPickMode(mode),
@@ -95,6 +123,285 @@ export class Editor {
         this.ui.updateAnimationWorkspace(this.selected?.animationPlayer.time || 0, this.selected?.animationPlayer.playing || false);
         const allPolygons = this.scene.meshes.reduce((sum, mesh) => sum + mesh.faceCount, 0);
         this.ui.setPolygonCount(this.selected?.faceCount || 0, allPolygons);
+    }
+
+    async initializeScenes() {
+        if (!this.sceneManager.activeScene) {
+            this.refreshSceneAssets();
+            const data = await this.serializeSceneData();
+            const record = await this.sceneManager.createScene(this.scene.name, data, { id: this.scene.assetId });
+            record.data.sceneAssetId = record.id;
+            this.scene.assetId = record.id;
+            this.sceneManager.persist();
+        } else {
+            await this.sceneManager.initializeActiveScene();
+        }
+        this.ui.refreshScenes();
+    }
+
+    async createScene() {
+        const sceneNumber = this.sceneManager.scenes.size + 1;
+        const record = await this.sceneManager.createScene(`Scene ${sceneNumber}`, {
+            format: 'lightweight-3d-scene',
+            version: 1,
+            coordinateSystem: { handedness: 'right', upAxis: 'Y', units: 'editor' },
+            sceneAssetId: null,
+            assetManifest: { version: 1, assets: [] },
+            light: null,
+            textureAssets: [],
+            meshes: []
+        });
+        record.data.sceneAssetId = record.id;
+        this.sceneManager.persist();
+        await this.sceneManager.loadScene(record.id);
+        this.ui.refreshScenes();
+        return record;
+    }
+
+    async saveScene() {
+        const record = await this.sceneManager.saveScene();
+        this.ui.refreshScenes();
+        return record;
+    }
+
+    async switchScene(id) {
+        const record = await this.sceneManager.loadScene(id);
+        this.ui.refreshScenes();
+        return record;
+    }
+
+    async duplicateScene() {
+        const record = await this.sceneManager.duplicateScene();
+        this.ui.refreshScenes();
+        return record;
+    }
+
+    async deleteScene() {
+        const removed = await this.sceneManager.deleteScene(this.sceneManager.activeSceneId);
+        this.ui.refreshScenes();
+        return removed;
+    }
+
+    async loadSceneFile(file) {
+        const data = JSON.parse(await file.text());
+        if (!data || !Array.isArray(data.meshes)) throw new TypeError('The selected file is not a scene export');
+        if (data.assetManifest) {
+            const assetIds = this.assetManager.importManifest(data.assetManifest);
+            this.remapImportedSceneAssetIds(data, assetIds);
+        }
+        const record = await this.sceneManager.createScene(data.sceneName || file.name.replace(/\.[^.]+$/, '') || 'Imported Scene', data);
+        record.references = (data.sceneReferences || []).filter(id => this.sceneManager.get(id));
+        record.subScenes = (data.subScenes || []).filter(entry => this.sceneManager.get(entry.sceneId)).map(entry => ({
+            sceneId: entry.sceneId,
+            streaming: entry.streaming !== false,
+            loaded: false
+        }));
+        this.sceneManager.persist();
+        await this.sceneManager.loadScene(record.id);
+        this.ui.refreshScenes();
+        return record;
+    }
+
+    remapImportedSceneAssetIds(data, assetIds) {
+        const remap = id => assetIds.get(id) || id;
+        data.sceneAssetId = remap(data.sceneAssetId);
+        data.assetManifest = {
+            ...data.assetManifest,
+            assets: data.assetManifest.assets.map(asset => ({
+                ...asset,
+                id: remap(asset.id),
+                dependencies: (asset.dependencies || []).map(remap),
+                data: asset.data?.textureAssetId ? { ...asset.data, textureAssetId: remap(asset.data.textureAssetId) } : asset.data
+            }))
+        };
+        (data.textureAssets || []).forEach(asset => { asset.id = remap(asset.id); });
+        (data.meshes || []).forEach(mesh => {
+            ['assetId', 'materialAssetId', 'skeletonAssetId', 'animationAssetId', 'textureAssetId'].forEach(field => {
+                if (mesh[field]) mesh[field] = remap(mesh[field]);
+            });
+            mesh.faceTextureIds = (mesh.faceTextureIds || []).map(remap);
+        });
+    }
+
+    async addSceneReference(id) {
+        const result = this.sceneManager.addReference(this.sceneManager.activeSceneId, id);
+        this.ui.refreshScenes();
+        return result;
+    }
+
+    removeSceneReference(id) {
+        const result = this.sceneManager.removeReference(this.sceneManager.activeSceneId, id);
+        this.ui.refreshScenes();
+        return result;
+    }
+
+    async addSubScene(id, streaming) {
+        const result = await this.sceneManager.addSubScene(this.sceneManager.activeSceneId, id, { streaming });
+        this.ui.refreshScenes();
+        return result;
+    }
+
+    async toggleSubScene(id) {
+        const link = this.getSubSceneState(id);
+        if (!link) return false;
+        const result = link.loaded
+            ? await this.sceneManager.unloadSubScene(this.sceneManager.activeSceneId, id)
+            : await this.sceneManager.loadSubScene(this.sceneManager.activeSceneId, id);
+        this.ui.refreshScenes();
+        return result;
+    }
+
+    getSubSceneState(id) {
+        return this.sceneManager.activeScene?.subScenes.find(entry => entry.sceneId === id) || null;
+    }
+
+    async activateSceneData(data, record) {
+        this.scene.meshes.length = 0;
+        this.streamedSubScenes.clear();
+        this.scene.name = record.name;
+        this.scene.assetId = record.id;
+        this.scene.light = null;
+        this.undoStack.length = 0;
+        this.redoStack.length = 0;
+        await this.importSceneData(data, { reuseExistingAssets: true, setSceneId: true });
+        this.scene.name = record.name;
+        this.scene.assetId = data.sceneAssetId || record.id;
+        if (!this.scene.light) this.scene.light = new DirectionalLight();
+        this.ui.refreshLight();
+        this.select(this.scene.meshes[0] || null);
+        this.ui.refreshScenes();
+    }
+
+    async loadSubSceneData(sceneId, data) {
+        if (this.streamedSubScenes.has(sceneId)) return false;
+        const imported = await this.importSceneData(data, {
+            reuseExistingAssets: true,
+            includeLighting: false,
+            setSceneId: false,
+            refreshAssets: false,
+            selectImported: false
+        });
+        this.streamedSubScenes.set(sceneId, new Set(imported));
+        this.refreshSceneAssets();
+        this.ui.refreshHierarchy();
+        return true;
+    }
+
+    async unloadSubSceneData(sceneId) {
+        const meshes = this.streamedSubScenes.get(sceneId);
+        if (!meshes) return false;
+        this.scene.meshes = this.scene.meshes.filter(mesh => !meshes.has(mesh));
+        this.streamedSubScenes.delete(sceneId);
+        if (meshes.has(this.selected)) this.select(this.getAuthoredMeshes().at(-1) || null);
+        this.refreshSceneAssets();
+        this.ui.refreshHierarchy();
+        return true;
+    }
+
+    getAuthoredMeshes() {
+        const streamed = new Set([...this.streamedSubScenes.values()].flatMap(meshes => [...meshes]));
+        return this.scene.meshes.filter(mesh => !streamed.has(mesh));
+    }
+
+    refreshSceneAssets() {
+        const sceneMeshes = this.getAuthoredMeshes();
+        const sceneAsset = this.assetManager.register({
+            id: this.scene.assetId,
+            name: this.scene.name || 'Scene',
+            type: 'scene',
+            resource: this.scene,
+            metadata: { meshCount: sceneMeshes.length }
+        });
+        this.scene.assetId = sceneAsset.id;
+
+        const meshAssetIds = [];
+        const authoredMeshSet = new Set(sceneMeshes);
+        this.scene.meshes.forEach((mesh, index) => {
+            const materialAsset = this.assetManager.register({
+                id: mesh.material.assetId,
+                name: `${mesh.name || 'Mesh'} Material`,
+                type: 'material',
+                resource: mesh.material,
+                metadata: { shading: mesh.material.shading || 'toon' },
+                data: {
+                    color: [...mesh.material.color],
+                    useTexture: !!mesh.material.useTexture,
+                    shading: mesh.material.shading || 'toon',
+                    textureAssetId: mesh.textureAssetId || null
+                }
+            });
+            mesh.material.assetId = materialAsset.id;
+
+            const skeletonData = mesh.skeleton.bones.map(bone => ({
+                name: bone.name,
+                parent: bone.parent?.name || null,
+                position: [...bone.position],
+                rotation: [...bone.rotation],
+                scale: [...bone.scale],
+                length: bone.length,
+                bindPosition: [...bone.bindPosition],
+                bindRotation: [...bone.bindRotation],
+                bindScale: [...bone.bindScale]
+            }));
+            const skeletonAsset = this.assetManager.register({
+                id: mesh.skeleton.assetId,
+                name: `${mesh.name || 'Mesh'} Skeleton`,
+                type: 'skeleton',
+                resource: mesh.skeleton,
+                metadata: { boneCount: skeletonData.length },
+                data: { bones: skeletonData }
+            });
+            mesh.skeleton.assetId = skeletonAsset.id;
+
+            let animationAsset = null;
+            if (mesh.animationClip) {
+                const tracks = mesh.animationClip.tracks.map(track => ({
+                    boneName: track.boneName || null,
+                    property: track.property,
+                    times: [...track.times],
+                    values: track.values.map(value => Array.isArray(value) ? [...value] : value)
+                }));
+                animationAsset = this.assetManager.register({
+                    id: mesh.animationClip.assetId,
+                    name: mesh.animationClip.name || `${mesh.name || 'Mesh'} Animation`,
+                    type: 'animation',
+                    resource: mesh.animationClip,
+                    metadata: { duration: mesh.animationClip.duration, trackCount: tracks.length },
+                    data: { duration: mesh.animationClip.duration, tracks }
+                });
+                mesh.animationClip.assetId = animationAsset.id;
+            }
+
+            const meshAsset = this.assetManager.register({
+                id: mesh.assetId,
+                name: mesh.name || `Mesh ${index + 1}`,
+                type: 'mesh',
+                resource: mesh,
+                metadata: { polygonCount: mesh.faceCount },
+                data: { sceneIndex: index }
+            });
+            mesh.assetId = meshAsset.id;
+            const textureDependencies = [mesh.textureAssetId, ...(mesh.faceTextureIds || [])]
+                .filter(id => id && this.assetManager.get(id));
+            this.assetManager.setDependencies(materialAsset.id, [mesh.textureAssetId].filter(id => id && this.assetManager.get(id)));
+            this.assetManager.setDependencies(meshAsset.id, [...new Set([
+                materialAsset.id,
+                skeletonAsset.id,
+                animationAsset?.id,
+                ...textureDependencies
+            ].filter(Boolean))]);
+            if (authoredMeshSet.has(mesh)) meshAssetIds.push(meshAsset.id);
+        });
+
+        this.assetManager.register({
+            id: this.scene.assetId,
+            name: this.scene.name || 'Scene',
+            type: 'scene',
+            resource: this.scene,
+            metadata: { meshCount: meshAssetIds.length },
+            data: { meshAssetIds }
+        });
+        this.assetManager.setDependencies(sceneAsset.id, meshAssetIds);
     }
 
     async importTexture(file) {
@@ -263,11 +570,27 @@ export class Editor {
         mesh.name = file.name.replace(/\.[^.]+$/, '') || 'Imported Mesh';
         mesh.position = [0, 0.5, 0];
         this.scene.add(mesh);
+        this.refreshSceneAssets();
         this.select(mesh);
     }
 
-    async importSceneData(data) {
-        if (data.light) {
+    async importSceneData(data, { reuseExistingAssets = false, includeLighting = true, setSceneId = false, refreshAssets = true, selectImported = true } = {}) {
+        const assetIds = data.assetManifest ? this.assetManager.importManifest(data.assetManifest, { reuseExisting: reuseExistingAssets }) : new Map();
+        const reserveCollidingId = (id, type) => {
+            if (id && !assetIds.has(id) && this.assetManager.get(id)) assetIds.set(id, this.assetManager.createId(type));
+        };
+        if (!data.assetManifest && !reuseExistingAssets) {
+            if (setSceneId) reserveCollidingId(data.sceneAssetId, 'scene');
+            (data.textureAssets || []).forEach(asset => reserveCollidingId(asset.id, 'texture'));
+            (data.meshes || []).forEach(meshData => {
+                reserveCollidingId(meshData.assetId, 'mesh');
+                reserveCollidingId(meshData.materialAssetId, 'material');
+                reserveCollidingId(meshData.skeletonAssetId, 'skeleton');
+                reserveCollidingId(meshData.animationAssetId, 'animation');
+            });
+        }
+        if (setSceneId && data.sceneAssetId) this.scene.assetId = assetIds.get(data.sceneAssetId) || data.sceneAssetId;
+        if (includeLighting && data.light) {
             const importedLight = new DirectionalLight(data.light);
             if (this.scene.light) Object.assign(this.scene.light, importedLight);
             else this.scene.light = importedLight;
@@ -275,12 +598,14 @@ export class Editor {
         }
         const textureIds = new Map();
         for (const assetData of data.textureAssets || []) {
-            const asset = await this.textureLibrary.importExportedAsset(assetData);
+            const textureId = assetIds.get(assetData.id) || assetData.id;
+            const existingTexture = reuseExistingAssets ? this.textureLibrary.get(textureId) : null;
+            const asset = existingTexture || await this.textureLibrary.importExportedAsset(assetData, { id: textureId });
             textureIds.set(assetData.id, asset.id);
         }
-        const resolveTexture = id => this.textureLibrary.get(textureIds.get(id) || id);
+        const resolveTexture = id => this.textureLibrary.get(textureIds.get(id) || assetIds.get(id) || id);
         const importedMeshes = [];
-        for (const meshData of data.meshes) {
+        for (const meshData of data.meshes || []) {
             const mesh = new Mesh(new Material({ color: [...(meshData.color || [0.78, 0.84, 0.92])], shading: meshData.shading || 'toon' }));
             if (meshData.polygons) {
                 mesh.polygons = meshData.polygons.map(polygon => polygon.map(vertex => [...vertex]));
@@ -298,6 +623,9 @@ export class Editor {
                 mesh.polygons = faces.map(face => face.map(index => [...vertices[index]]));
             }
             mesh.name = meshData.name || 'Imported Mesh';
+            mesh.assetId = assetIds.get(meshData.assetId) || meshData.assetId || null;
+            mesh.material.assetId = assetIds.get(meshData.materialAssetId) || meshData.materialAssetId || null;
+            mesh.skeleton.assetId = assetIds.get(meshData.skeletonAssetId) || meshData.skeletonAssetId || null;
             mesh.position = [...(meshData.position || [0, 0, 0])];
             mesh.rotation = [...(meshData.rotation || [0, 0, 0])];
             mesh.scale = [...(meshData.scale || [1, 1, 1])];
@@ -348,15 +676,16 @@ export class Editor {
                 });
             }));
 
-            mesh.textureAssetId = textureIds.get(meshData.textureAssetId) || meshData.textureAssetId || null;
+            mesh.textureAssetId = textureIds.get(meshData.textureAssetId) || assetIds.get(meshData.textureAssetId) || meshData.textureAssetId || null;
             const meshTexture = resolveTexture(meshData.textureAssetId);
             mesh.material.texture = meshTexture?.texture || null;
             mesh.material.useTexture = !!mesh.material.texture;
-            mesh.faceTextureIds = (meshData.faceTextureIds || []).map(id => textureIds.get(id) || id || null);
+            mesh.faceTextureIds = (meshData.faceTextureIds || []).map(id => textureIds.get(id) || assetIds.get(id) || id || null);
             mesh.faceTextures = mesh.faceTextureIds.map(id => resolveTexture(id)?.texture || null);
 
             if (meshData.animation) {
                 const clip = new AnimationClip(meshData.animation.name || 'Imported Animation', meshData.animation.duration || 1);
+                clip.assetId = assetIds.get(meshData.animationAssetId) || meshData.animationAssetId || null;
                 (meshData.animation.tracks || []).forEach(track => {
                     if (track.boneName) track.times.forEach((time, index) => clip.addBoneKeyframe(track.boneName, track.property, time, track.values[index]));
                     else clip.addTrack(track.property, [...track.times], track.values.map(value => [...value]));
@@ -366,8 +695,10 @@ export class Editor {
             this.scene.add(mesh);
             importedMeshes.push(mesh);
         }
+        if (refreshAssets) this.refreshSceneAssets();
         this.ui.refreshTextures();
-        if (importedMeshes.length) this.select(importedMeshes[importedMeshes.length - 1]);
+        if (selectImported && importedMeshes.length) this.select(importedMeshes[importedMeshes.length - 1]);
+        return importedMeshes;
     }
 
     addCube() {
@@ -381,6 +712,7 @@ export class Editor {
         mesh.name = `${type} ${this.scene.meshes.length + 1}`;
         mesh.position = [0, 0.5, 0];
         this.scene.add(mesh);
+        this.refreshSceneAssets();
         this.select(mesh);
     }
 
@@ -423,6 +755,7 @@ export class Editor {
                 if (index + 1 < amount) await new Promise(resolve => setTimeout(resolve, 0));
             }
         }
+        this.refreshSceneAssets();
         this.select(lastMesh);
     }
 
@@ -482,6 +815,7 @@ export class Editor {
             else duplicate.animationClip.addTrack(track.property, [...track.times], track.values.map(value => [...value]));
         });
         this.scene.add(duplicate);
+        this.refreshSceneAssets();
         this.select(duplicate);
     }
 
@@ -491,6 +825,7 @@ export class Editor {
         if (index < 0) return;
         this.recordHistory();
         this.scene.remove(mesh);
+        this.refreshSceneAssets();
         if (mesh === this.selected) this.select(this.scene.meshes[Math.min(index, this.scene.meshes.length - 1)] || null);
         else this.ui.refreshHierarchy();
     }
@@ -510,6 +845,7 @@ export class Editor {
     }
 
     snapshotScene() {
+        const authoredMeshes = this.getAuthoredMeshes();
         const snapshot = {
             light: this.scene.light ? {
                 name: this.scene.light.name,
@@ -519,8 +855,12 @@ export class Editor {
                 threshold: this.scene.light.threshold,
                 shadeColor: this.scene.light.shadeColor
             } : null,
-            selectedIndex: this.scene.meshes.indexOf(this.selected),
-            meshes: this.scene.meshes.map(mesh => ({
+            selectedIndex: authoredMeshes.indexOf(this.selected),
+            meshes: authoredMeshes.map(mesh => ({
+                assetId: mesh.assetId,
+                materialAssetId: mesh.material.assetId,
+                skeletonAssetId: mesh.skeleton.assetId,
+                animationAssetId: mesh.animationClip?.assetId || null,
                 name: mesh.name,
                 position: mesh.position,
                 rotation: mesh.rotation,
@@ -577,8 +917,10 @@ export class Editor {
     }
 
     async restoreHistorySnapshot(snapshot) {
+        const streamedMeshes = [...this.streamedSubScenes.values()].flatMap(meshes => [...meshes]);
         this.scene.meshes.length = 0;
-        await this.importSceneData(snapshot);
+        await this.importSceneData(snapshot, { reuseExistingAssets: true });
+        this.scene.meshes.push(...streamedMeshes);
         if (snapshot.light) {
             if (!this.scene.light) this.scene.light = new DirectionalLight(snapshot.light);
             else Object.assign(this.scene.light, new DirectionalLight(snapshot.light));
@@ -590,7 +932,8 @@ export class Editor {
             mesh.selectedVertex = meshData.selectedVertex || null;
             mesh.selectedBone = meshData.selectedBone ?? null;
         });
-        this.select(this.scene.meshes[snapshot.selectedIndex] || null);
+        this.refreshSceneAssets();
+        this.select(this.getAuthoredMeshes()[snapshot.selectedIndex] || null);
     }
 
     async undo() {
@@ -607,11 +950,34 @@ export class Editor {
         await this.restoreHistorySnapshot(snapshot);
     }
 
-    async exportScene() {
+    async serializeSceneData() {
+        this.refreshSceneAssets();
+        const activeRecord = this.sceneManager?.activeScene;
+        const allAssets = this.assetManager.toJSON();
+        const assetsById = new Map(allAssets.assets.map(asset => [asset.id, asset]));
+        const reachableAssets = new Set([this.scene.assetId]);
+        const pendingAssetIds = [this.scene.assetId];
+        while (pendingAssetIds.length) {
+            const asset = assetsById.get(pendingAssetIds.pop());
+            for (const dependencyId of asset?.dependencies || []) {
+                if (reachableAssets.has(dependencyId)) continue;
+                reachableAssets.add(dependencyId);
+                pendingAssetIds.push(dependencyId);
+            }
+        }
+        const assetManifest = {
+            ...allAssets,
+            assets: allAssets.assets.filter(asset => reachableAssets.has(asset.id))
+        };
         const data = {
             format: 'lightweight-3d-scene',
             version: 1,
             coordinateSystem: { handedness: 'right', upAxis: 'Y', units: 'editor' },
+            sceneName: this.scene.name,
+            sceneAssetId: this.scene.assetId,
+            sceneReferences: activeRecord ? [...activeRecord.references] : [],
+            subScenes: activeRecord ? activeRecord.subScenes.map(({ sceneId, streaming }) => ({ sceneId, streaming })) : [],
+            assetManifest,
             light: this.scene.light ? {
                 name: this.scene.light.name,
                 direction: this.scene.light.direction,
@@ -620,8 +986,12 @@ export class Editor {
                 threshold: this.scene.light.threshold,
                 shadeColor: this.scene.light.shadeColor
             } : null,
-            textureAssets: await this.textureLibrary.getExportData(),
-            meshes: this.scene.meshes.map(mesh => ({
+            textureAssets: (await this.textureLibrary.getExportData()).filter(asset => reachableAssets.has(asset.id)),
+            meshes: this.getAuthoredMeshes().map(mesh => ({
+                assetId: mesh.assetId,
+                materialAssetId: mesh.material.assetId,
+                skeletonAssetId: mesh.skeleton.assetId,
+                animationAssetId: mesh.animationClip?.assetId || null,
                 name: mesh.name,
                 position: mesh.position,
                 rotation: mesh.rotation,
@@ -658,6 +1028,11 @@ export class Editor {
                 }))
             }))
         };
+        return data;
+    }
+
+    async exportScene() {
+        const data = await this.serializeSceneData();
         const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
         const link = document.createElement('a');
         link.href = URL.createObjectURL(blob);
@@ -1911,31 +2286,47 @@ export function createLightingPanel(light, onHistory = () => {}) {
 
 ===== FILE: editor/textureLibrary.js =====
 import { loadTextureBlob } from '../engine/loader.js';
+import { AssetManager } from '../engine/assetManager.js';
 
 export class TextureLibrary {
-    constructor(gl) {
+    constructor(gl, assetManager = new AssetManager()) {
         this.gl = gl;
+        this.assetManager = assetManager;
         this.assets = [];
-        this.nextId = 1;
     }
 
-    async addFile(file) {
+    async addFile(file, assetOptions = {}) {
         const texture = await loadTextureBlob(file, this.gl);
         const previewUrl = URL.createObjectURL(file);
-        return this.addTexture(file.name, texture, previewUrl, file);
+        return this.addTexture(file.name, texture, previewUrl, file, assetOptions);
     }
 
-    addTexture(name, texture, previewUrl = null, sourceBlob = null) {
+    addTexture(name, texture, previewUrl = null, sourceBlob = null, assetOptions = {}) {
         const previewImage = previewUrl && typeof Image !== 'undefined' ? new Image() : null;
         if (previewImage) previewImage.src = previewUrl;
         const asset = {
-            id: `texture-${this.nextId++}`,
+            id: assetOptions.id || null,
             name: name || 'Image',
+            type: 'texture',
             texture,
             previewImage,
             sourceBlob,
-            sourceUrl: previewUrl && !previewUrl.startsWith('blob:') ? previewUrl : null
+            sourceUrl: previewUrl && !previewUrl.startsWith('blob:') ? previewUrl : null,
+            metadata: assetOptions.metadata || { mimeType: sourceBlob?.type || null },
+            thumbnail: assetOptions.thumbnail || previewUrl || null
         };
+        const registered = this.assetManager.register({
+            id: asset.id,
+            name: asset.name,
+            type: 'texture',
+            resource: asset,
+            metadata: asset.metadata,
+            thumbnail: asset.thumbnail,
+            data: assetOptions.data ?? null
+        });
+        asset.id = registered.id;
+        asset.metadata = registered.metadata;
+        asset.thumbnail = registered.thumbnail;
         this.assets.push(asset);
         return asset;
     }
@@ -1954,17 +2345,31 @@ export class TextureLibrary {
             for (let offset = 0; offset < bytes.length; offset += 8192) {
                 binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
             }
-            exported.push({ id: asset.id, name: asset.name, type: blob.type || 'application/octet-stream', data: btoa(binary) });
+            const registered = this.assetManager.get(asset.id);
+            exported.push({
+                id: asset.id,
+                name: asset.name,
+                type: blob.type || 'application/octet-stream',
+                assetType: 'texture',
+                metadata: registered?.metadata || asset.metadata,
+                dependencies: registered ? [...registered.dependencies] : [],
+                thumbnail: asset.thumbnail?.startsWith('data:') ? asset.thumbnail : null,
+                data: btoa(binary)
+            });
         }
         return exported;
     }
 
-    async importExportedAsset(data) {
+    async importExportedAsset(data, assetOptions = {}) {
         const binary = atob(data.data);
         const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
         const blob = new Blob([bytes], { type: data.type || 'application/octet-stream' });
         const file = new File([blob], data.name || 'Image', { type: blob.type });
-        const asset = await this.addFile(file);
+        const asset = await this.addFile(file, {
+            id: assetOptions.id || data.id,
+            metadata: data.metadata,
+            thumbnail: data.thumbnail
+        });
         return asset;
     }
 
@@ -1983,17 +2388,19 @@ import { DirectionalLight } from '../engine/light.js';
 
 export function createUI(root, options) {
     const { scene, onSelect, onSelectFace, onSetPickMode, onAddCube, onAddPlane, onAddSphere, onAddCylinder, onAddBatch, onDuplicate, onAddFace, onExtrudeFace, onMergeFace, onMergeVertices, onAddVertex, onAddBone, onRemoveBone, onCreateAnimation, onKeyPose, onDeleteBoneKeys, onSeekAnimation, onToggleAnimation, onRenameAnimation, onSetAnimationDuration, onImportMesh, onImportTexture, onDelete, onReorderMesh, onResetCamera, onExport, onUndo, onRedo, onHistory = () => {} } = options;
+    const sceneActions = options.sceneActions || {};
     root.style.pointerEvents = 'none';
     root.innerHTML = '';
+    let saveCurrentLayout = () => {};
+    let resetCurrentLayout = () => {};
 
     const style = document.createElement('style');
     style.textContent = `
         #ui-root { color: #e8edf5; font: 13px/1.4 system-ui, sans-serif; }
         .internal-fps { position: fixed; right: 12px; bottom: 12px; z-index: 20; padding: 6px 9px; color: #bfe9d3; background: rgba(13, 23, 20, 0.92); border: 1px solid rgba(115, 190, 150, 0.45); font: 12px/1.3 ui-monospace, monospace; font-variant-numeric: tabular-nums; pointer-events: none; }
         .polygon-counter { position: fixed; right: 12px; bottom: 44px; z-index: 20; max-width: calc(100vw - 24px); padding: 6px 9px; color: #d7e8fa; background: rgba(15, 23, 34, 0.94); border: 1px solid rgba(130, 165, 202, 0.4); font: 12px/1.3 ui-monospace, monospace; font-variant-numeric: tabular-nums; pointer-events: none; }
-        .editor-shell { position: fixed; top: 12px; left: 12px; z-index: 10; display: flex; flex-direction: column; gap: 8px; width: min(calc(100vw - 24px), 920px); max-height: calc(100vh - 24px); box-sizing: border-box; overflow: visible; pointer-events: none; }
-        .editor-toolbar { background: rgba(16, 22, 32, 0.92); border: 1px solid rgba(164, 183, 211, 0.2); box-shadow: 0 10px 30px rgba(0,0,0,.25); pointer-events: auto; }
-        .editor-toolbar { display: flex; flex-direction: column; gap: 5px; padding: 7px; }
+        .editor-shell { position: fixed; inset: 0; z-index: 10; display: grid; grid-template-columns: minmax(210px, 18vw) minmax(0, 1fr) minmax(250px, 22vw); grid-template-rows: auto minmax(180px, 1fr) minmax(190px, 28vh); grid-template-areas: 'toolbar toolbar toolbar' 'hierarchy viewport inspector' 'assets assets animation'; box-sizing: border-box; overflow: hidden; pointer-events: none; }
+        .editor-toolbar { grid-area: toolbar; display: flex; align-items: center; flex-wrap: wrap; gap: 5px; padding: 5px 8px; background: rgba(16, 20, 25, 0.98); border-bottom: 1px solid #343b43; pointer-events: auto; }
         .editor-toolbar-head { position: relative; display: flex; align-items: center; gap: 6px; min-height: 26px; }
         .tool-group { min-width: 0; }
         .tool-group summary { padding: 5px 8px; color: #9ed8ff; background: #101722; border: 1px solid #26384d; cursor: pointer; list-style: none; }
@@ -2001,13 +2408,17 @@ export function createUI(root, options) {
         .tool-group summary::before { content: '+'; display: inline-block; width: 18px; color: #ffd071; }
         .tool-group[open] summary::before { content: '-'; }
         .tool-group-content { display: flex; flex-wrap: wrap; gap: 5px; padding: 6px 0 2px; }
+        .scene-controls { display: grid; grid-template-columns: repeat(3, minmax(92px, 1fr)); gap: 5px; width: min(390px, 100%); }
+        .scene-controls .scene-wide { grid-column: 1 / -1; }
+        .scene-controls .check-row { grid-column: 1 / -1; margin: 0; }
+        .scene-status { grid-column: 1 / -1; min-height: 16px; color: #9aa9ba; font: 11px/1.3 ui-monospace, monospace; }
         .batch-create-controls { display: grid; grid-template-columns: minmax(100px, 1fr) 80px 80px auto; gap: 5px; align-items: center; width: 100%; }
         .batch-create-status { grid-column: 1 / -1; min-height: 16px; color: #9aa9ba; font: 11px/1.3 ui-monospace, monospace; }
-        .editor-title { margin: 0 12px 0 4px; font-size: 14px; letter-spacing: .04em; text-transform: uppercase; color: #9ed8ff; }
-        .editor-button { border: 1px solid #3b526d; background: #1b2a3b; color: #e8edf5; padding: 6px 10px; cursor: pointer; border-radius: 3px; }
-        .editor-button:hover { background: #29425c; }
+        .editor-title { margin: 0 8px 0 4px; font-size: 13px; font-weight: 650; letter-spacing: 0; text-transform: uppercase; color: #e8edf5; white-space: nowrap; }
+        .editor-button { border: 1px solid #48515b; background: #292f36; color: #e8edf5; padding: 5px 9px; cursor: pointer; border-radius: 2px; }
+        .editor-button:hover { background: #3a424b; }
         .editor-panels { display: contents; }
-        .editor-panel { min-width: 0; min-height: 0; padding: 10px; overflow: auto; scrollbar-width: thin; scrollbar-color: #526c88 #101722; pointer-events: auto; background: rgba(16, 22, 32, 0.92); border: 1px solid rgba(164, 183, 211, 0.2); box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+        .editor-panel { box-sizing: border-box; width: 100%; min-width: 0; min-height: 0; padding: 10px; overflow: auto; scrollbar-width: thin; scrollbar-color: #59636e #171b20; pointer-events: auto; background: rgba(24, 28, 33, 0.97); }
         .panel-title { margin: 0 0 8px; color: #9ed8ff; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
         .hierarchy-list { list-style: none; padding: 0; margin: 0; }
         .hierarchy-item { display: flex; align-items: center; gap: 4px; padding: 2px; border: 1px solid transparent; }
@@ -2021,9 +2432,13 @@ export function createUI(root, options) {
         .vector-fields { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
         .editor-input { box-sizing: border-box; width: 100%; min-width: 0; border: 1px solid #3b526d; background: #101722; color: #e8edf5; padding: 5px; pointer-events: auto; }
         .editor-panel button, .editor-panel label, .editor-panel input, .hierarchy-item { pointer-events: auto; }
-        .panel-disclosure { position: fixed; z-index: 11; width: min(300px, calc(100vw - 24px)); max-height: min(86vh, 820px); min-height: 34px; overflow: hidden; color: #e8edf5; background: rgba(16, 22, 32, 0.96); border: 1px solid rgba(164, 183, 211, 0.3); box-shadow: 0 10px 30px rgba(0,0,0,.28); pointer-events: auto; }
+        .panel-disclosure { position: relative; z-index: 2; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; color: #e8edf5; background: #181c21; border: 1px solid #343b43; pointer-events: auto; }
+        .panel-disclosure[data-dock='hierarchy'] { grid-area: hierarchy; }
+        .panel-disclosure[data-dock='inspector'] { grid-area: inspector; }
+        .panel-disclosure[data-dock='assets'] { grid-area: assets; }
+        .panel-disclosure[data-dock='animation'] { grid-area: animation; }
         .panel-disclosure:not([open]) { height: auto !important; }
-        .panel-disclosure[open] { display: flex; flex-direction: column; }
+        .panel-disclosure[open] { min-height: 0; }
         .panel-disclosure[open] > .editor-panel { flex: 1; }
         .panel-disclosure > summary { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: 0 0 34px; min-height: 34px; box-sizing: border-box; padding: 4px 7px; color: #9ed8ff; background: rgba(16, 22, 32, 0.98); cursor: pointer; pointer-events: auto; list-style: none; }
         .panel-disclosure > summary::-webkit-details-marker { display: none; }
@@ -2032,7 +2447,9 @@ export function createUI(root, options) {
         .panel-drag-handle { position: absolute; top: 4px; left: 50%; width: 42px; height: 25px; padding: 0; border: 1px solid #3b526d; background: #101722; color: #9aa9ba; cursor: move; touch-action: none; transform: translateX(-50%); }
         .panel-drag-handle:active { color: #ffd071; }
         .panel-resize-handle { position: absolute; right: 1px; bottom: 1px; z-index: 12; display: none; width: 20px; height: 20px; padding: 0; border: 0; background: transparent; cursor: nwse-resize; pointer-events: auto; touch-action: none; }
-        .panel-disclosure[open] > .panel-resize-handle { display: block; }
+        .panel-disclosure[data-floating='true'][open] > .panel-resize-handle { display: block; }
+        .panel-disclosure[data-floating='true'] { position: fixed; z-index: 20; width: min(340px, calc(100vw - 24px)); height: min(55vh, 620px); max-height: calc(100vh - 16px); border: 1px solid #505963; box-shadow: 0 12px 32px rgba(0,0,0,.48); }
+        .panel-disclosure[data-floating='true'] > .editor-panel { min-height: 0; }
         .panel-resize-handle::after { position: absolute; right: 3px; bottom: 3px; width: 9px; height: 9px; border-right: 2px solid #9aa9ba; border-bottom: 2px solid #9aa9ba; content: ''; }
         .editor-button.selected { background: #284a68; border-color: #9ed8ff; }
         .face-title { margin: 0 0 8px; color: #ffd071; font-weight: 700; }
@@ -2072,7 +2489,7 @@ export function createUI(root, options) {
         .skinning-disclosure .bone-weight-group { padding: 8px 0 0; border-top: 0; }
         .bone-weight-group .editor-button { margin: 4px 4px 0 0; }
         .asset-item { padding: 5px 7px; background: #101722; border: 1px solid #26384d; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .uv-workspace { display: none; flex-direction: column; width: 100%; height: min(68vh, 620px); min-height: 360px; box-sizing: border-box; padding: 10px; background: rgba(16, 22, 32, 0.96); border: 1px solid rgba(164, 183, 211, 0.2); pointer-events: auto; }
+        .uv-workspace { grid-area: viewport; display: none; flex-direction: column; min-width: 0; min-height: 0; box-sizing: border-box; padding: 10px; background: rgba(24, 28, 33, 0.98); border: 1px solid #343b43; pointer-events: auto; }
         .uv-workspace-title { margin: 0 0 8px; color: #9ed8ff; font-size: 11px; text-transform: uppercase; }
         .uv-image-row { display: flex; align-items: center; gap: 8px; max-width: 400px; margin-bottom: 8px; color: #9aa9ba; font-size: 11px; text-transform: uppercase; }
         .uv-image-row .editor-input { flex: 1; }
@@ -2083,7 +2500,7 @@ export function createUI(root, options) {
         .uv-canvas:active { cursor: grabbing; }
         .editor-shell.uv-mode .uv-workspace { display: flex; }
         .editor-shell.uv-mode .editor-panels { display: none; }
-        @media (max-width: 700px) { .editor-toolbar { flex-wrap: wrap; } .editor-title { width: 100%; } }
+        @media (max-width: 760px) { .editor-shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(150px, 36vh) minmax(110px, 22vh) minmax(110px, 22vh) minmax(110px, 22vh) minmax(110px, 22vh); grid-template-areas: 'toolbar' 'viewport' 'hierarchy' 'inspector' 'assets' 'animation'; overflow: auto; } .editor-toolbar { position: sticky; top: 0; z-index: 5; } .panel-disclosure[data-floating='true'] { max-width: calc(100vw - 16px); } }
     `;
     root.appendChild(style);
     const fpsReadout = document.createElement('div');
@@ -2125,8 +2542,19 @@ export function createUI(root, options) {
     toolbarHead.className = 'editor-toolbar-head';
     const title = document.createElement('h1');
     title.className = 'editor-title';
-    title.textContent = 'Lightweight 3D';
+    title.textContent = 'Engine Editor';
     toolbarHead.appendChild(title);
+    const saveLayoutButton = document.createElement('button');
+    saveLayoutButton.className = 'editor-button';
+    saveLayoutButton.type = 'button';
+    saveLayoutButton.textContent = 'Save Layout';
+    saveLayoutButton.addEventListener('click', () => saveCurrentLayout());
+    const resetLayoutButton = document.createElement('button');
+    resetLayoutButton.className = 'editor-button';
+    resetLayoutButton.type = 'button';
+    resetLayoutButton.textContent = 'Reset Layout';
+    resetLayoutButton.addEventListener('click', () => resetCurrentLayout());
+    toolbarHead.append(saveLayoutButton, resetLayoutButton);
     toolbar.appendChild(toolbarHead);
     let activeToolGroup = toolbarHead;
 
@@ -2226,6 +2654,113 @@ export function createUI(root, options) {
     group('View & Scene');
     button('Center View', onResetCamera);
     button('Export', onExport);
+    const sceneControls = document.createElement('div');
+    sceneControls.className = 'scene-controls';
+    activeToolGroup.appendChild(sceneControls);
+    const createSceneSelect = label => {
+        const select = document.createElement('select');
+        select.className = 'editor-input scene-wide';
+        select.setAttribute('aria-label', label);
+        sceneControls.appendChild(select);
+        return select;
+    };
+    const createSceneButton = (label, action, success) => {
+        const element = document.createElement('button');
+        element.className = 'editor-button';
+        element.type = 'button';
+        element.textContent = label;
+        element.addEventListener('click', () => runSceneAction(action, success));
+        sceneControls.appendChild(element);
+        return element;
+    };
+    const sceneSelect = createSceneSelect('Active scene');
+    const referenceTarget = createSceneSelect('Scene to reference');
+    const referenceSelect = createSceneSelect('Referenced scene');
+    const subSceneTarget = createSceneSelect('Sub-scene to load');
+    const sceneStatus = document.createElement('output');
+    sceneStatus.className = 'scene-status';
+    sceneControls.appendChild(sceneStatus);
+    const addReferenceButton = createSceneButton('Add Reference', () => sceneActions.addReference?.(referenceTarget.value), 'Scene reference added');
+    const removeReferenceButton = createSceneButton('Remove Reference', () => sceneActions.removeReference?.(referenceSelect.value), 'Scene reference removed');
+    const addSubSceneButton = createSceneButton('Add Sub-scene', () => sceneActions.addSubScene?.(subSceneTarget.value, streamingInput.checked), 'Sub-scene linked');
+    const streamSubSceneButton = createSceneButton('Load Sub-scene', () => sceneActions.toggleSubScene?.(subSceneTarget.value), 'Sub-scene state updated');
+    const newSceneButton = createSceneButton('New Scene', () => sceneActions.create?.(), 'Scene created');
+    const saveSceneButton = createSceneButton('Save Scene', () => sceneActions.save?.(), 'Scene saved');
+    const duplicateSceneButton = createSceneButton('Duplicate', () => sceneActions.duplicate?.(), 'Scene duplicated');
+    const deleteSceneButton = createSceneButton('Delete Scene', () => sceneActions.delete?.(), 'Scene deleted');
+    const streamingLabel = document.createElement('label');
+    streamingLabel.className = 'check-row';
+    const streamingInput = document.createElement('input');
+    streamingInput.type = 'checkbox';
+    streamingInput.checked = true;
+    streamingLabel.append(streamingInput, document.createTextNode('Stream on demand'));
+    sceneControls.appendChild(streamingLabel);
+    const loadSceneLabel = document.createElement('label');
+    loadSceneLabel.className = 'editor-button';
+    loadSceneLabel.textContent = 'Import Scene';
+    const loadSceneInput = document.createElement('input');
+    loadSceneInput.type = 'file';
+    loadSceneInput.accept = '.json,application/json';
+    loadSceneInput.hidden = true;
+    loadSceneInput.addEventListener('change', () => {
+        const file = loadSceneInput.files?.[0];
+        if (file) runSceneAction(() => sceneActions.loadFile?.(file), 'Scene imported');
+        loadSceneInput.value = '';
+    });
+    loadSceneLabel.appendChild(loadSceneInput);
+    sceneControls.appendChild(loadSceneLabel);
+    sceneSelect.addEventListener('change', () => runSceneAction(() => sceneActions.switch?.(sceneSelect.value), 'Scene switched'));
+
+    function refreshScenes() {
+        const records = sceneActions.list?.() || [];
+        const activeId = sceneActions.activeId?.() || '';
+        const activeRecord = records.find(record => record.id === activeId);
+        const fill = (select, entries, selectedId, placeholder) => {
+            select.innerHTML = '';
+            if (!entries.length) {
+                const empty = document.createElement('option');
+                empty.value = '';
+                empty.textContent = placeholder;
+                select.appendChild(empty);
+            }
+            entries.forEach(record => {
+                const option = document.createElement('option');
+                option.value = record.id;
+                option.textContent = record.name;
+                select.appendChild(option);
+            });
+            if (entries.some(record => record.id === selectedId)) select.value = selectedId;
+        };
+        fill(sceneSelect, records, activeId, 'No scenes');
+        fill(referenceTarget, records.filter(record => record.id !== activeId), referenceTarget.value, 'No other scenes');
+        const referencedRecords = (activeRecord?.references || []).map(id => records.find(record => record.id === id)).filter(Boolean);
+        fill(referenceSelect, referencedRecords, referenceSelect.value, 'No references');
+        const subSceneRecords = records.filter(record => record.id !== activeId);
+        fill(subSceneTarget, subSceneRecords, subSceneTarget.value, 'No available sub-scenes');
+        const subScene = sceneActions.subSceneState?.(subSceneTarget.value);
+        streamSubSceneButton.textContent = subScene?.loaded ? 'Unload Sub-scene' : 'Load Sub-scene';
+        streamSubSceneButton.disabled = !subScene;
+        addSubSceneButton.disabled = !subSceneTarget.value || !!subScene;
+        addReferenceButton.disabled = !referenceTarget.value || !!activeRecord?.references.includes(referenceTarget.value);
+        removeReferenceButton.disabled = !referenceSelect.value;
+        deleteSceneButton.disabled = records.length <= 1;
+        saveSceneButton.disabled = !activeId;
+        duplicateSceneButton.disabled = !activeId;
+    }
+
+    async function runSceneAction(action, success) {
+        try {
+            if (typeof action !== 'function') return;
+            await action();
+            sceneStatus.textContent = success;
+        } catch (error) {
+            sceneStatus.textContent = `Scene operation failed: ${error.message || error}`;
+        }
+        refreshScenes();
+    }
+
+    [referenceTarget, referenceSelect, subSceneTarget].forEach(select => select.addEventListener('change', refreshScenes));
+    refreshScenes();
     const uvWorkspace = document.createElement('div');
     uvWorkspace.className = 'uv-workspace';
     const uvTitle = document.createElement('h2');
@@ -2562,26 +3097,55 @@ export function createUI(root, options) {
     if (!scene.light) scene.light = new DirectionalLight();
     const lighting = createLightingPanel(scene.light, onHistory);
 
+    const layoutStorageKey = 'lightweight-3d-layout';
+    const panelDefaults = {
+        hierarchy: { dock: 'hierarchy', open: true },
+        inspector: { dock: 'inspector', open: true },
+        assets: { dock: 'assets', open: true },
+        'rig-and-animation': { dock: 'animation', open: true },
+        'key-light': { dock: 'inspector', open: false, floating: true }
+    };
+    let savedLayout = {};
+    try { savedLayout = JSON.parse(localStorage.getItem(layoutStorageKey) || '{}'); } catch {}
+    const persistPanelLayout = disclosure => {
+        try {
+            const layout = JSON.parse(localStorage.getItem(layoutStorageKey) || '{}');
+            const rect = disclosure.getBoundingClientRect();
+            layout[disclosure.dataset.panel] = {
+                dock: disclosure.dataset.dock,
+                floating: disclosure.dataset.floating === 'true',
+                open: disclosure.open,
+                ...(disclosure.dataset.floating === 'true' ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : {})
+            };
+            localStorage.setItem(layoutStorageKey, JSON.stringify(layout));
+        } catch {}
+    };
+
     const panelDisclosure = (label, element, index) => {
         const disclosure = document.createElement('details');
         disclosure.className = 'panel-disclosure';
-        disclosure.open = false;
-        disclosure.style.top = `${92 + index * 42}px`;
-        disclosure.style.right = '12px';
-        const positionKey = `lightweight-3d-panel:${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+        const panelKey = label.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+        const defaults = panelDefaults[panelKey] || { dock: 'assets', open: false };
+        const savedPanel = savedLayout[panelKey];
+        const positionKey = `lightweight-3d-panel:${panelKey}`;
+        let legacyPosition = null;
         try {
-            const savedPosition = JSON.parse(localStorage.getItem(positionKey) || 'null');
-            if (Number.isFinite(savedPosition?.left) && Number.isFinite(savedPosition?.top)) {
-                disclosure.style.left = `${Math.max(0, Math.min(window.innerWidth - 120, savedPosition.left))}px`;
-                disclosure.style.right = 'auto';
-                disclosure.style.top = `${Math.max(0, Math.min(window.innerHeight - 36, savedPosition.top))}px`;
-            }
-            if (Number.isFinite(savedPosition?.width)) disclosure.style.width = `${Math.max(220, Math.min(window.innerWidth - 24, savedPosition.width))}px`;
-            if (Number.isFinite(savedPosition?.height)) {
-                disclosure.style.height = `${Math.max(120, Math.min(window.innerHeight - 24, savedPosition.height))}px`;
-                disclosure.dataset.resized = 'true';
-            }
+            legacyPosition = JSON.parse(localStorage.getItem(positionKey) || 'null');
         } catch {}
+        disclosure.dataset.panel = panelKey;
+        disclosure.dataset.dock = savedPanel?.dock || defaults.dock;
+        const isFloating = typeof savedPanel?.floating === 'boolean' ? savedPanel.floating : !!legacyPosition || !!defaults.floating;
+        disclosure.dataset.floating = String(isFloating);
+        disclosure.open = typeof savedPanel?.open === 'boolean' ? savedPanel.open : defaults.open;
+        if (isFloating) {
+            const position = savedPanel || legacyPosition || {};
+            disclosure.style.top = `${Math.max(8, Math.min(window.innerHeight - 44, Number(position.top) || 64 + index * 42))}px`;
+            disclosure.style.right = Number.isFinite(position.left) ? 'auto' : '12px';
+            if (Number.isFinite(position.left)) disclosure.style.left = `${Math.max(0, Math.min(window.innerWidth - 120, position.left))}px`;
+            if (Number.isFinite(position.width)) disclosure.style.width = `${Math.max(220, Math.min(window.innerWidth - 16, position.width))}px`;
+            if (Number.isFinite(position.height)) disclosure.style.height = `${Math.max(120, Math.min(window.innerHeight - 16, position.height))}px`;
+        }
+        disclosure.addEventListener('toggle', () => persistPanelLayout(disclosure));
         const summary = document.createElement('summary');
         const title = document.createElement('span');
         title.textContent = label;
@@ -2597,11 +3161,15 @@ export function createUI(root, options) {
             event.stopPropagation();
             const rect = disclosure.getBoundingClientRect();
             dragHandle.setPointerCapture(event.pointerId);
+            disclosure.dataset.floating = 'true';
             disclosure.dataset.dragPointer = String(event.pointerId);
             disclosure.dataset.dragX = String(event.clientX - rect.left);
             disclosure.dataset.dragY = String(event.clientY - rect.top);
             disclosure.style.right = 'auto';
             disclosure.style.left = `${rect.left}px`;
+            disclosure.style.top = `${rect.top}px`;
+            disclosure.style.width = `${rect.width}px`;
+            disclosure.style.height = `${rect.height}px`;
         });
         dragHandle.addEventListener('pointermove', event => {
             if (disclosure.dataset.dragPointer !== String(event.pointerId)) return;
@@ -2617,12 +3185,21 @@ export function createUI(root, options) {
             delete disclosure.dataset.dragPointer;
             delete disclosure.dataset.dragX;
             delete disclosure.dataset.dragY;
-            try {
-                const rect = disclosure.getBoundingClientRect();
-                const savedPosition = { left: rect.left, top: rect.top };
-                if (disclosure.dataset.resized) Object.assign(savedPosition, { width: rect.width, height: rect.height });
-                localStorage.setItem(positionKey, JSON.stringify(savedPosition));
-            } catch {}
+            const dock = event.clientX < 36 ? 'hierarchy'
+                : event.clientX > window.innerWidth - 36 ? 'inspector'
+                    : event.clientY > window.innerHeight - 36 ? (event.clientX < window.innerWidth / 2 ? 'assets' : 'animation')
+                        : null;
+            if (dock) {
+                const occupied = Array.from(panels.children).find(panel => panel !== disclosure && panel.dataset.dock === dock && panel.dataset.floating !== 'true');
+                if (occupied) {
+                    occupied.dataset.dock = disclosure.dataset.dock;
+                    persistPanelLayout(occupied);
+                }
+                disclosure.dataset.dock = dock;
+                disclosure.dataset.floating = 'false';
+                ['left', 'top', 'right', 'width', 'height'].forEach(property => disclosure.style.removeProperty(property));
+            }
+            persistPanelLayout(disclosure);
         };
         dragHandle.addEventListener('pointerup', finishPanelDrag);
         dragHandle.addEventListener('pointercancel', finishPanelDrag);
@@ -2632,7 +3209,7 @@ export function createUI(root, options) {
         resizeHandle.title = `Drag to resize ${label} panel`;
         resizeHandle.setAttribute('aria-label', `Resize ${label} panel`);
         resizeHandle.addEventListener('pointerdown', event => {
-            if (event.button !== 0 || !disclosure.open) return;
+            if (event.button !== 0 || !disclosure.open || disclosure.dataset.floating !== 'true') return;
             event.preventDefault();
             event.stopPropagation();
             const rect = disclosure.getBoundingClientRect();
@@ -2660,11 +3237,7 @@ export function createUI(root, options) {
             if (disclosure.dataset.resizePointer !== String(event.pointerId)) return;
             ['resizePointer', 'resizeX', 'resizeY', 'resizeWidth', 'resizeHeight'].forEach(key => delete disclosure.dataset[key]);
             disclosure.dataset.resized = 'true';
-            try {
-                const rect = disclosure.getBoundingClientRect();
-                const savedPosition = JSON.parse(localStorage.getItem(positionKey) || '{}');
-                localStorage.setItem(positionKey, JSON.stringify({ ...savedPosition, left: rect.left, top: rect.top, width: rect.width, height: rect.height }));
-            } catch {}
+            persistPanelLayout(disclosure);
         };
         resizeHandle.addEventListener('pointerup', finishPanelResize);
         resizeHandle.addEventListener('pointercancel', finishPanelResize);
@@ -2677,6 +3250,22 @@ export function createUI(root, options) {
     panels.appendChild(panelDisclosure('Assets', assets.element, 2));
     panels.appendChild(panelDisclosure('Rig and Animation', bones.element, 3));
     panels.appendChild(panelDisclosure('Key Light', lighting.element, 4));
+    saveCurrentLayout = () => panels.querySelectorAll('.panel-disclosure').forEach(persistPanelLayout);
+    resetCurrentLayout = () => {
+        try { localStorage.removeItem(layoutStorageKey); } catch {}
+        panels.querySelectorAll('.panel-disclosure').forEach(disclosure => {
+            const defaults = panelDefaults[disclosure.dataset.panel] || { dock: 'assets', open: false };
+            disclosure.dataset.dock = defaults.dock;
+            disclosure.dataset.floating = String(!!defaults.floating);
+            disclosure.open = defaults.open;
+            ['left', 'top', 'right', 'width', 'height'].forEach(property => disclosure.style.removeProperty(property));
+            if (defaults.floating) {
+                disclosure.style.top = '64px';
+                disclosure.style.right = '12px';
+            }
+        });
+        saveCurrentLayout();
+    };
 
     return {
         setSelected: mesh => { selectedMesh = mesh; inspector.setMesh(mesh); bones.setMesh(mesh); refreshUvTextures(); refreshUvTransformControls(); refreshFaceImageControls(); drawUvWorkspace(); },
@@ -2686,6 +3275,7 @@ export function createUI(root, options) {
         setInternalFps: (fps, frameMs) => { fpsReadout.textContent = `Internal FPS ${Math.round(fps)} | ${frameMs.toFixed(2)} ms`; },
         setPolygonCount: (current, total) => { polygonReadout.textContent = `Current Mesh Polygons / All Polygons: ${current} / ${total}`; },
         refreshTextures: () => { assets.refresh(); inspector.refresh(); refreshUvTextures(); },
+        refreshScenes,
         refreshLight: lighting.refresh,
         updateUvWorkspace: drawUvWorkspace,
         updateAnimationWorkspace: (time, playing) => bones.updatePlayback(time, playing),
@@ -2832,6 +3422,236 @@ export class AnimationPlayer {
         this.time = (this.time + deltaTime) % this.clip.duration;
         this.clip.apply(this.target, this.time);
     }
+}
+
+===== FILE: engine/assetManager.js =====
+const ASSET_TYPES = new Set([
+    'mesh',
+    'material',
+    'texture',
+    'animation',
+    'skeleton',
+    'scene',
+    'prefab',
+    'audio'
+]);
+
+export class AssetManager {
+    constructor() {
+        this.assets = new Map();
+        this.resourceIds = new WeakMap();
+        this.sequence = 0;
+    }
+
+    createId(type = 'asset') {
+        let id;
+        do {
+            const uuid = globalThis.crypto?.randomUUID?.();
+            this.sequence++;
+            id = `${type}-${uuid || `${Date.now().toString(36)}-${this.sequence.toString(36)}`}`;
+        } while (this.assets.has(id));
+        return id;
+    }
+
+    register(options = {}) {
+        const { type, name = 'Untitled', resource = null, id = null, metadata = {}, dependencies = [], thumbnail = null, data = null } = options;
+        if (!ASSET_TYPES.has(type)) throw new TypeError(`Unsupported asset type: ${type}`);
+        const resourceId = this.getIdForResource(resource);
+        if (resourceId) {
+            const existing = this.assets.get(resourceId);
+            if (existing.type !== type) throw new TypeError(`Resource is already registered as ${existing.type}`);
+            this.updateAsset(existing, { name, metadata, thumbnail, data });
+            return existing;
+        }
+
+        let assetId = typeof id === 'string' && id ? id : this.createId(type);
+        let existing = this.assets.get(assetId);
+        if (existing && existing.type === type && id === assetId) {
+            if (Object.hasOwn(options, 'resource')) {
+                if (existing.resource && typeof existing.resource === 'object') this.resourceIds.delete(existing.resource);
+                existing.resource = resource;
+                if (resource && typeof resource === 'object') this.resourceIds.set(resource, assetId);
+            }
+            this.updateAsset(existing, { name, metadata, thumbnail, data });
+            if (dependencies.length) this.setDependencies(assetId, dependencies);
+            return existing;
+        }
+        if (existing && existing.type === type && !existing.resource) {
+            existing.resource = resource;
+            this.updateAsset(existing, { name, metadata, thumbnail, data });
+            if (resource && typeof resource === 'object') this.resourceIds.set(resource, assetId);
+            if (dependencies.length) this.setDependencies(assetId, dependencies);
+            return existing;
+        }
+        if (existing) assetId = this.createId(type);
+
+        const asset = {
+            id: assetId,
+            name: String(name || 'Untitled'),
+            type,
+            metadata: cloneJson(metadata || {}),
+            dependencies: new Set(),
+            thumbnail: typeof thumbnail === 'string' ? thumbnail : null,
+            resource,
+            data: cloneJson(data)
+        };
+        this.assets.set(assetId, asset);
+        if (resource && typeof resource === 'object') this.resourceIds.set(resource, assetId);
+        if (dependencies.length) this.setDependencies(assetId, dependencies);
+        return asset;
+    }
+
+    updateAsset(asset, { name, metadata, thumbnail, data }) {
+        if (name !== undefined) asset.name = String(name || 'Untitled');
+        if (metadata !== undefined) asset.metadata = cloneJson(metadata || {});
+        if (thumbnail !== undefined) asset.thumbnail = typeof thumbnail === 'string' ? thumbnail : null;
+        if (data !== undefined) asset.data = cloneJson(data);
+    }
+
+    get(id) {
+        return this.assets.get(id) || null;
+    }
+
+    getByType(type) {
+        return [...this.assets.values()].filter(asset => asset.type === type);
+    }
+
+    getIdForResource(resource) {
+        if (!resource || typeof resource !== 'object') return null;
+        return this.resourceIds.get(resource) || null;
+    }
+
+    rename(id, name) {
+        const asset = this.get(id);
+        if (!asset || !String(name).trim()) return false;
+        asset.name = String(name).trim();
+        return true;
+    }
+
+    updateMetadata(id, metadata) {
+        const asset = this.get(id);
+        if (!asset) return false;
+        asset.metadata = { ...asset.metadata, ...cloneJson(metadata || {}) };
+        return true;
+    }
+
+    setThumbnail(id, thumbnail) {
+        const asset = this.get(id);
+        if (!asset) return false;
+        asset.thumbnail = typeof thumbnail === 'string' ? thumbnail : null;
+        return true;
+    }
+
+    setDependencies(id, dependencies) {
+        const asset = this.get(id);
+        if (!asset) throw new Error(`Unknown asset: ${id}`);
+        const next = new Set(dependencies);
+        if (next.has(id)) throw new Error('An asset cannot depend on itself');
+        for (const dependencyId of next) {
+            if (!this.assets.has(dependencyId)) throw new Error(`Unknown dependency: ${dependencyId}`);
+        }
+        asset.dependencies = next;
+        return asset;
+    }
+
+    addDependency(id, dependencyId) {
+        const asset = this.get(id);
+        if (!asset) throw new Error(`Unknown asset: ${id}`);
+        if (!this.assets.has(dependencyId)) throw new Error(`Unknown dependency: ${dependencyId}`);
+        if (id === dependencyId) throw new Error('An asset cannot depend on itself');
+        asset.dependencies.add(dependencyId);
+        return true;
+    }
+
+    getDependents(id) {
+        return [...this.assets.values()].filter(asset => asset.dependencies.has(id));
+    }
+
+    remove(id, { cascade = false } = {}) {
+        if (!this.assets.has(id)) return false;
+        const visited = new Set();
+        const removeAsset = assetId => {
+            if (visited.has(assetId)) return;
+            visited.add(assetId);
+            const dependents = this.getDependents(assetId);
+            if (dependents.length && !cascade) throw new Error(`Asset ${assetId} is still in use`);
+            dependents.forEach(dependent => removeAsset(dependent.id));
+            const asset = this.assets.get(assetId);
+            if (asset?.resource && this.getIdForResource(asset.resource) === assetId) this.resourceIds.delete(asset.resource);
+            this.assets.delete(assetId);
+        };
+        removeAsset(id);
+        return true;
+    }
+
+    toJSON() {
+        return {
+            version: 1,
+            assets: [...this.assets.values()].map(asset => ({
+                id: asset.id,
+                name: asset.name,
+                type: asset.type,
+                metadata: cloneJson(asset.metadata),
+                dependencies: [...asset.dependencies],
+                thumbnail: asset.thumbnail?.startsWith('blob:') ? null : asset.thumbnail,
+                data: cloneJson(asset.data)
+            }))
+        };
+    }
+
+    importManifest(manifest, { reuseExisting = false } = {}) {
+        if (!manifest || !Array.isArray(manifest.assets)) throw new TypeError('Invalid asset manifest');
+        if (manifest.version !== 1) throw new TypeError(`Unsupported asset manifest version: ${manifest.version}`);
+
+        const sourceIds = new Set();
+        for (const source of manifest.assets) {
+            if (!source || typeof source.id !== 'string' || !source.id) throw new TypeError('Asset manifest entries require an ID');
+            if (sourceIds.has(source.id)) throw new TypeError(`Duplicate asset ID in manifest: ${source.id}`);
+            if (!ASSET_TYPES.has(source.type)) throw new TypeError(`Unsupported asset type: ${source.type}`);
+            if (source.dependencies !== undefined && !Array.isArray(source.dependencies)) throw new TypeError(`Invalid dependencies for asset: ${source.id}`);
+            cloneJson(source.metadata || {});
+            cloneJson(source.data);
+            sourceIds.add(source.id);
+        }
+        for (const source of manifest.assets) {
+            for (const dependencyId of source.dependencies || []) {
+                if (!sourceIds.has(dependencyId) && !this.assets.has(dependencyId)) {
+                    throw new Error(`Unknown dependency: ${dependencyId}`);
+                }
+            }
+        }
+
+        const idMap = new Map();
+        const pending = [];
+        for (const source of manifest.assets) {
+            const existing = this.assets.get(source.id);
+            if (reuseExisting && existing && existing.type !== source.type) {
+                throw new TypeError(`Asset type mismatch for ID: ${source.id}`);
+            }
+            const id = existing && !(reuseExisting && existing.type === source.type) ? this.createId(source.type) : source.id;
+            const asset = this.register({
+                id,
+                type: source.type,
+                name: source.name,
+                metadata: source.metadata,
+                thumbnail: source.thumbnail,
+                data: source.data
+            });
+            idMap.set(source.id, asset.id);
+            pending.push({ assetId: asset.id, dependencies: source.dependencies || [] });
+        }
+
+        for (const entry of pending) {
+            const dependencies = entry.dependencies.map(id => idMap.get(id) || id);
+            this.setDependencies(entry.assetId, dependencies);
+        }
+        return idMap;
+    }
+}
+
+function cloneJson(value) {
+    if (value === null || value === undefined) return null;
+    return JSON.parse(JSON.stringify(value));
 }
 
 ===== FILE: engine/camera.js =====
@@ -4388,6 +5208,8 @@ import { DirectionalLight } from './light.js';
 
 export class Scene {
     constructor() {
+        this.name = 'Untitled Scene';
+        this.assetId = null;
         this.meshes = [];
         this.light = new DirectionalLight();
     }
@@ -4413,6 +5235,324 @@ export class Scene {
     update(dt) {
         this.meshes.forEach(mesh => mesh.animationPlayer?.update(dt));
     }
+}
+
+===== FILE: engine/sceneManager.js =====
+const SCENE_STORAGE_VERSION = 1;
+
+export class SceneManager {
+    constructor({
+        storageKey = 'lightweight-3d-scenes',
+        storage = getLocalStorage(),
+        serializeActive = async () => null,
+        activateScene = async () => {},
+        loadSubScene = async () => {},
+        unloadSubScene = async () => {}
+    } = {}) {
+        this.storageKey = storageKey;
+        this.storage = storage;
+        this.serializeActive = serializeActive;
+        this.activateScene = activateScene;
+        this.loadSubSceneCallback = loadSubScene;
+        this.unloadSubSceneCallback = unloadSubScene;
+        this.scenes = new Map();
+        this.activeSceneId = null;
+        this.restore();
+    }
+
+    restore() {
+        if (!this.storage) return false;
+        try {
+            const document = JSON.parse(this.storage.getItem(this.storageKey) || 'null');
+            if (document?.version !== SCENE_STORAGE_VERSION || !Array.isArray(document.scenes)) return false;
+            for (const source of document.scenes) {
+                if (!source || typeof source.id !== 'string' || !source.id || !source.data || typeof source.data !== 'object') continue;
+                if (this.scenes.has(source.id)) continue;
+                this.scenes.set(source.id, {
+                    id: source.id,
+                    name: String(source.name || 'Scene'),
+                    data: cloneJson(source.data),
+                    references: uniqueStrings(source.references),
+                    subScenes: normalizeSubScenes(source.subScenes),
+                    updatedAt: Number(source.updatedAt) || 0
+                });
+            }
+            this.activeSceneId = this.scenes.has(document.activeSceneId) ? document.activeSceneId : this.scenes.keys().next().value || null;
+            return this.scenes.size > 0;
+        } catch {
+            this.scenes.clear();
+            this.activeSceneId = null;
+            return false;
+        }
+    }
+
+    list() {
+        return [...this.scenes.values()].map(scene => ({
+            id: scene.id,
+            name: scene.name,
+            references: [...scene.references],
+            subScenes: scene.subScenes.map(subScene => ({ ...subScene })),
+            updatedAt: scene.updatedAt
+        }));
+    }
+
+    get(id) {
+        return this.scenes.get(id) || null;
+    }
+
+    get activeScene() {
+        return this.get(this.activeSceneId);
+    }
+
+    async createScene(name, data, { id = null, activate = false } = {}) {
+        if (!data || typeof data !== 'object') throw new TypeError('Scene data is required');
+        const sceneId = id || createId('scene');
+        if (this.scenes.has(sceneId)) throw new Error(`Scene already exists: ${sceneId}`);
+        const previousSceneId = this.activeSceneId;
+        const scene = {
+            id: sceneId,
+            name: String(name || 'Scene').trim() || 'Scene',
+            data: cloneJson(data),
+            references: [],
+            subScenes: [],
+            updatedAt: Date.now()
+        };
+        this.scenes.set(sceneId, scene);
+        if (activate && previousSceneId) {
+            await this.saveScene(previousSceneId);
+            await this.unloadLoadedSubScenes(this.activeScene);
+            this.activeSceneId = sceneId;
+            await this.activateScene(cloneJson(scene.data), scene);
+            for (const subScene of scene.subScenes) {
+                if (!subScene.streaming) await this.loadSubScene(scene.id, subScene.sceneId);
+            }
+        } else if (!this.activeSceneId) {
+            this.activeSceneId = sceneId;
+            if (activate) await this.activateScene(cloneJson(scene.data), scene);
+        }
+        this.persist();
+        return scene;
+    }
+
+    async saveScene(id = this.activeSceneId) {
+        const scene = this.get(id);
+        if (!scene) throw new Error(`Unknown scene: ${id}`);
+        if (id === this.activeSceneId) {
+            const data = await this.serializeActive();
+            if (!data || typeof data !== 'object') throw new Error('The active scene could not be serialized');
+            scene.data = cloneJson(data);
+        }
+        scene.updatedAt = Date.now();
+        this.persist();
+        return scene;
+    }
+
+    async initializeActiveScene() {
+        const scene = this.activeScene;
+        if (!scene) return null;
+        await this.activateScene(cloneJson(scene.data), scene);
+        for (const subScene of scene.subScenes) {
+            if (!subScene.streaming) await this.loadSubScene(scene.id, subScene.sceneId);
+        }
+        this.persist();
+        return scene;
+    }
+
+    async loadScene(id) {
+        const target = this.get(id);
+        if (!target) throw new Error(`Unknown scene: ${id}`);
+        if (id === this.activeSceneId) return target;
+        if (this.activeSceneId) await this.saveScene(this.activeSceneId);
+        await this.unloadLoadedSubScenes(this.activeScene);
+        await this.activateScene(cloneJson(target.data), target);
+        this.activeSceneId = id;
+        for (const subScene of target.subScenes) {
+            if (!subScene.streaming && !subScene.loaded) await this.loadSubScene(target.id, subScene.sceneId);
+        }
+        this.persist();
+        return target;
+    }
+
+    async duplicateScene(id = this.activeSceneId, name = null) {
+        const source = this.get(id);
+        if (!source) throw new Error(`Unknown scene: ${id}`);
+        if (id === this.activeSceneId) await this.saveScene(id);
+        const clonedData = cloneJson(source.data);
+        const sceneId = duplicateSceneAssetIds(clonedData);
+        const duplicate = await this.createScene(name || `${source.name} Copy`, clonedData, { id: sceneId });
+        duplicate.references = source.references.map(reference => reference === id ? sceneId : reference);
+        duplicate.subScenes = source.subScenes.map(subScene => ({ ...subScene, loaded: false }));
+        this.persist();
+        return duplicate;
+    }
+
+    async deleteScene(id) {
+        const target = this.get(id);
+        if (!target) return false;
+        if (this.scenes.size === 1) throw new Error('The last scene cannot be deleted');
+        if (id === this.activeSceneId) {
+            await this.saveScene(id);
+            const nextScene = [...this.scenes.keys()].find(sceneId => sceneId !== id);
+            await this.loadScene(nextScene);
+        }
+        for (const scene of this.scenes.values()) {
+            const loadedChild = scene.subScenes.find(subScene => subScene.sceneId === id && subScene.loaded);
+            if (scene.id === this.activeSceneId && loadedChild) await this.unloadSubScene(scene.id, id);
+            scene.references = scene.references.filter(reference => reference !== id);
+            scene.subScenes = scene.subScenes.filter(subScene => subScene.sceneId !== id);
+        }
+        this.scenes.delete(id);
+        this.persist();
+        return true;
+    }
+
+    renameScene(id, name) {
+        const scene = this.get(id);
+        const nextName = String(name || '').trim();
+        if (!scene || !nextName) return false;
+        scene.name = nextName;
+        scene.updatedAt = Date.now();
+        this.persist();
+        return true;
+    }
+
+    addReference(sceneId, referencedSceneId) {
+        const scene = this.get(sceneId);
+        if (!scene || !this.scenes.has(referencedSceneId)) throw new Error('Both referenced scenes must exist');
+        if (sceneId === referencedSceneId) throw new Error('A scene cannot reference itself');
+        if (!scene.references.includes(referencedSceneId)) scene.references.push(referencedSceneId);
+        this.persist();
+        return true;
+    }
+
+    removeReference(sceneId, referencedSceneId) {
+        const scene = this.get(sceneId);
+        if (!scene) return false;
+        const referenceCount = scene.references.length;
+        scene.references = scene.references.filter(id => id !== referencedSceneId);
+        if (scene.references.length !== referenceCount) this.persist();
+        return scene.references.length !== referenceCount;
+    }
+
+    addSubScene(parentId, childId, { streaming = true } = {}) {
+        const parent = this.get(parentId);
+        if (!parent || !this.scenes.has(childId)) throw new Error('Both sub-scenes must exist');
+        if (parentId === childId || this.hasSubScenePath(childId, parentId)) throw new Error('Sub-scene relationships cannot contain cycles');
+        if (parent.subScenes.some(subScene => subScene.sceneId === childId)) return false;
+        parent.subScenes.push({ sceneId: childId, streaming: !!streaming, loaded: false });
+        this.persist();
+        if (!streaming && parentId === this.activeSceneId) return this.loadSubScene(parentId, childId);
+        return true;
+    }
+
+    async loadSubScene(parentId, childId) {
+        const parent = this.get(parentId);
+        const link = parent?.subScenes.find(subScene => subScene.sceneId === childId);
+        const child = this.get(childId);
+        if (!link || !child) throw new Error('The sub-scene relationship does not exist');
+        if (parentId !== this.activeSceneId) throw new Error('Only the active scene can stream sub-scenes');
+        if (link.loaded) return false;
+        await this.loadSubSceneCallback(child.id, cloneJson(child.data));
+        link.loaded = true;
+        this.persist();
+        return true;
+    }
+
+    async unloadSubScene(parentId, childId) {
+        const parent = this.get(parentId);
+        const link = parent?.subScenes.find(subScene => subScene.sceneId === childId);
+        if (!link?.loaded) return false;
+        await this.unloadSubSceneCallback(childId);
+        link.loaded = false;
+        this.persist();
+        return true;
+    }
+
+    async unloadLoadedSubScenes(scene) {
+        if (!scene) return;
+        for (const subScene of scene.subScenes) {
+            if (!subScene.loaded) continue;
+            await this.unloadSubSceneCallback(subScene.sceneId);
+            subScene.loaded = false;
+        }
+    }
+
+    hasSubScenePath(fromId, targetId, visited = new Set()) {
+        if (fromId === targetId) return true;
+        if (visited.has(fromId)) return false;
+        visited.add(fromId);
+        const scene = this.get(fromId);
+        return !!scene?.subScenes.some(subScene => this.hasSubScenePath(subScene.sceneId, targetId, visited));
+    }
+
+    persist() {
+        if (!this.storage) return false;
+        const document = {
+            version: SCENE_STORAGE_VERSION,
+            activeSceneId: this.activeSceneId,
+            scenes: [...this.scenes.values()].map(scene => ({
+                id: scene.id,
+                name: scene.name,
+                data: scene.data,
+                references: scene.references,
+                subScenes: scene.subScenes,
+                updatedAt: scene.updatedAt
+            }))
+        };
+        try {
+            this.storage.setItem(this.storageKey, JSON.stringify(document));
+            return true;
+        } catch (error) {
+            throw new Error(`Could not save scenes to local storage: ${error.message || error}`);
+        }
+    }
+}
+
+function duplicateSceneAssetIds(data) {
+    const manifest = data.assetManifest;
+    const ids = new Map();
+    if (Array.isArray(manifest?.assets)) {
+        manifest.assets.forEach(asset => {
+            if (asset.type !== 'texture') ids.set(asset.id, createId(asset.type));
+        });
+        manifest.assets.forEach(asset => {
+            asset.id = ids.get(asset.id) || asset.id;
+            asset.dependencies = (asset.dependencies || []).map(id => ids.get(id) || id);
+        });
+    }
+    if (data.sceneAssetId) data.sceneAssetId = ids.get(data.sceneAssetId) || createId('scene');
+    for (const mesh of data.meshes || []) {
+        for (const field of ['assetId', 'materialAssetId', 'skeletonAssetId', 'animationAssetId']) {
+            if (mesh[field]) mesh[field] = ids.get(mesh[field]) || createId(field.replace('AssetId', '').replace(/^[a-z]/, letter => letter.toLowerCase()));
+        }
+    }
+    return data.sceneAssetId || createId('scene');
+}
+
+function normalizeSubScenes(subScenes) {
+    if (!Array.isArray(subScenes)) return [];
+    return subScenes.filter(entry => typeof entry?.sceneId === 'string').map(entry => ({
+        sceneId: entry.sceneId,
+        streaming: entry.streaming !== false,
+        loaded: false
+    }));
+}
+
+function uniqueStrings(values) {
+    return [...new Set(Array.isArray(values) ? values.filter(value => typeof value === 'string') : [])];
+}
+
+function createId(type) {
+    const uuid = globalThis.crypto?.randomUUID?.();
+    return `${type}-${uuid || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`}`;
+}
+
+function cloneJson(value) {
+    return JSON.parse(JSON.stringify(value));
+}
+
+function getLocalStorage() {
+    try { return globalThis.localStorage || null; } catch { return null; }
 }
 
 ===== FILE: engine/shaders/flat.frag =====
@@ -4656,6 +5796,7 @@ async function init() {
     editor = new Editor(scene, camera, renderer);
     if (tex) editor.textureLibrary.addTexture('example.webp', tex, './assets/textures/example.webp');
     editor.ui.refreshTextures();
+    await editor.initializeScenes();
     loop();
 }
 

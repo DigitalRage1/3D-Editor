@@ -26,7 +26,8 @@ export class AssetManager {
         return id;
     }
 
-    register({ type, name = 'Untitled', resource = null, id = null, metadata = {}, dependencies = [], thumbnail = null, data = null } = {}) {
+    register(options = {}) {
+        const { type, name = 'Untitled', resource = null, id = null, metadata = {}, dependencies = [], thumbnail = null, data = null } = options;
         if (!ASSET_TYPES.has(type)) throw new TypeError(`Unsupported asset type: ${type}`);
         const resourceId = this.getIdForResource(resource);
         if (resourceId) {
@@ -38,6 +39,16 @@ export class AssetManager {
 
         let assetId = typeof id === 'string' && id ? id : this.createId(type);
         let existing = this.assets.get(assetId);
+        if (existing && existing.type === type && id === assetId) {
+            if (Object.hasOwn(options, 'resource')) {
+                if (existing.resource && typeof existing.resource === 'object') this.resourceIds.delete(existing.resource);
+                existing.resource = resource;
+                if (resource && typeof resource === 'object') this.resourceIds.set(resource, assetId);
+            }
+            this.updateAsset(existing, { name, metadata, thumbnail, data });
+            if (dependencies.length) this.setDependencies(assetId, dependencies);
+            return existing;
+        }
         if (existing && existing.type === type && !existing.resource) {
             existing.resource = resource;
             this.updateAsset(existing, { name, metadata, thumbnail, data });
@@ -161,7 +172,7 @@ export class AssetManager {
         };
     }
 
-    importManifest(manifest) {
+    importManifest(manifest, { reuseExisting = false } = {}) {
         if (!manifest || !Array.isArray(manifest.assets)) throw new TypeError('Invalid asset manifest');
         if (manifest.version !== 1) throw new TypeError(`Unsupported asset manifest version: ${manifest.version}`);
 
@@ -186,7 +197,11 @@ export class AssetManager {
         const idMap = new Map();
         const pending = [];
         for (const source of manifest.assets) {
-            const id = this.assets.has(source.id) ? this.createId(source.type) : source.id;
+            const existing = this.assets.get(source.id);
+            if (reuseExisting && existing && existing.type !== source.type) {
+                throw new TypeError(`Asset type mismatch for ID: ${source.id}`);
+            }
+            const id = existing && !(reuseExisting && existing.type === source.type) ? this.createId(source.type) : source.id;
             const asset = this.register({
                 id,
                 type: source.type,

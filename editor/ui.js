@@ -6,7 +6,7 @@ import { createLightingPanel } from './panels/lighting.js';
 import { DirectionalLight } from '../engine/light.js';
 
 export function createUI(root, options) {
-    const { scene, onSelect, onSelectFace, onSetPickMode, onAddCube, onAddPlane, onAddSphere, onAddCylinder, onAddBatch, onDuplicate, onAddFace, onExtrudeFace, onMergeFace, onMergeVertices, onAddVertex, onAddBone, onRemoveBone, onCreateAnimation, onKeyPose, onDeleteBoneKeys, onSeekAnimation, onToggleAnimation, onRenameAnimation, onSetAnimationDuration, onImportMesh, onImportTexture, onDelete, onReorderMesh, onResetCamera, onExport, onUndo, onRedo, onHistory = () => {} } = options;
+    const { scene, onSelect, onSelectFace, onSetPickMode, onAddCube, onAddPlane, onAddSphere, onAddCylinder, onAddBatch, onDuplicate, onAddFace, onExtrudeFace, onMergeFace, onMergeVertices, onAddVertex, onAddBone, onRemoveBone, onCreateAnimation, onKeyPose, onDeleteBoneKeys, onSeekAnimation, onToggleAnimation, onRenameAnimation, onSetAnimationDuration, onImportMesh, onImportTexture, onDelete, onReorderMesh, onResetCamera, onExport, onUndo, onRedo, onHistory = () => {}, onKnifeTool, onBevel, onInset, onLoopCut, onBridge, onFill, onGridFill, onDissolve, onSplit, onSeparate, onTriangulate, onQuadRebuild, onRecalculateNormals, onFlipNormals } = options;
     const sceneActions = options.sceneActions || {};
     root.style.pointerEvents = 'none';
     root.innerHTML = '';
@@ -18,6 +18,7 @@ export function createUI(root, options) {
         #ui-root { color: #e8edf5; font: 13px/1.4 system-ui, sans-serif; }
         .internal-fps { position: fixed; right: 12px; bottom: 12px; z-index: 20; padding: 6px 9px; color: #bfe9d3; background: rgba(13, 23, 20, 0.92); border: 1px solid rgba(115, 190, 150, 0.45); font: 12px/1.3 ui-monospace, monospace; font-variant-numeric: tabular-nums; pointer-events: none; }
         .polygon-counter { position: fixed; right: 12px; bottom: 44px; z-index: 20; max-width: calc(100vw - 24px); padding: 6px 9px; color: #d7e8fa; background: rgba(15, 23, 34, 0.94); border: 1px solid rgba(130, 165, 202, 0.4); font: 12px/1.3 ui-monospace, monospace; font-variant-numeric: tabular-nums; pointer-events: none; }
+        .viewport-stats { position: fixed; left: 12px; bottom: 12px; z-index: 20; padding: 6px 9px; color: #d7e8fa; background: rgba(15, 23, 34, 0.94); border: 1px solid rgba(130, 165, 202, 0.4); font: 12px/1.3 ui-monospace, monospace; font-variant-numeric: tabular-nums; pointer-events: none; }
         .editor-shell { position: fixed; inset: 0; z-index: 10; display: grid; grid-template-columns: minmax(210px, 18vw) minmax(0, 1fr) minmax(250px, 22vw); grid-template-rows: auto minmax(180px, 1fr) minmax(190px, 28vh); grid-template-areas: 'toolbar toolbar toolbar' 'hierarchy viewport inspector' 'assets assets animation'; box-sizing: border-box; overflow: hidden; pointer-events: none; }
         .editor-toolbar { grid-area: toolbar; display: flex; align-items: center; flex-wrap: wrap; gap: 5px; padding: 5px 8px; background: rgba(16, 20, 25, 0.98); border-bottom: 1px solid #343b43; pointer-events: auto; }
         .editor-toolbar-head { position: relative; display: flex; align-items: center; gap: 6px; min-height: 26px; }
@@ -130,6 +131,10 @@ export function createUI(root, options) {
     polygonReadout.className = 'polygon-counter';
     polygonReadout.textContent = 'Current Mesh Polygons / All Polygons: 0 / 0';
     root.appendChild(polygonReadout);
+    const viewportStats = document.createElement('div');
+    viewportStats.className = 'viewport-stats';
+    viewportStats.textContent = 'Draw calls 0 | Triangles 0 | Objects 0';
+    root.appendChild(viewportStats);
     window.addEventListener('keydown', event => {
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
             event.preventDefault();
@@ -197,6 +202,7 @@ export function createUI(root, options) {
         element.textContent = label;
         element.addEventListener('click', handler);
         activeToolGroup.appendChild(element);
+        return element;
     };
 
     group('Modeling');
@@ -264,11 +270,111 @@ export function createUI(root, options) {
     button('+ Bone', () => onAddBone(null));
     button('Delete', onDelete);
 
+    group('Advanced Modeling');
+    button('Knife', onKnifeTool);
+    button('Bevel', onBevel);
+    button('Inset', onInset);
+    button('Loop Cut', onLoopCut);
+    button('Bridge', onBridge);
+    button('Fill', onFill);
+    button('Grid Fill', onGridFill);
+    button('Dissolve', onDissolve);
+    button('Split', onSplit);
+    button('Separate', onSeparate);
+    button('Triangulate', onTriangulate);
+    button('Quad Rebuild', onQuadRebuild);
+    button('Normals', onRecalculateNormals);
+    button('Flip Normals', onFlipNormals);
+
     group('Selection Mode');
     const modeButtons = document.createElement('div');
     modeButtons.className = 'tool-group-content';
     const modeGroup = activeToolGroup;
     modeGroup.appendChild(modeButtons);
+
+    group('Transform');
+    const transformButtons = new Map();
+    const setTransformTool = mode => {
+        transformButtons.forEach((element, key) => element.classList.toggle('selected', key === mode));
+        options.onSetTransformTool?.(mode);
+    };
+    [['Select', 'select'], ['Move', 'move'], ['Rotate', 'rotate'], ['Scale', 'scale']].forEach(([label, mode]) => {
+        transformButtons.set(mode, button(label, () => setTransformTool(mode)));
+    });
+    transformButtons.get('select').classList.add('selected');
+    const transformSpace = document.createElement('select');
+    transformSpace.className = 'editor-input';
+    transformSpace.setAttribute('aria-label', 'Transform space');
+    [['world', 'World'], ['local', 'Local']].forEach(([value, label]) => {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        transformSpace.appendChild(option);
+    });
+    transformSpace.addEventListener('change', () => options.onSetTransformSpace?.(transformSpace.value));
+    activeToolGroup.appendChild(transformSpace);
+
+    let selectedAxis = null;
+    const axisButtons = new Map();
+    ['x', 'y', 'z'].forEach(axis => {
+        axisButtons.set(axis, button(axis.toUpperCase(), () => {
+            selectedAxis = selectedAxis === axis ? null : axis;
+            axisButtons.forEach((element, key) => element.classList.toggle('selected', key === selectedAxis));
+            options.onSetAxisLock?.(axis);
+        }));
+    });
+    const snapSettings = { position: false, rotation: false, scale: false, positionStep: 0.5, rotationStep: 15, scaleStep: 0.1 };
+    const addSnapControl = (key, label, stepKey, defaultValue, minimum, increment) => {
+        const labelElement = document.createElement('label');
+        labelElement.className = 'check-row';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        const caption = document.createElement('span');
+        caption.textContent = label;
+        labelElement.append(checkbox, caption);
+        activeToolGroup.appendChild(labelElement);
+        const amount = document.createElement('input');
+        amount.className = 'editor-input';
+        amount.type = 'number';
+        amount.min = String(minimum);
+        amount.step = String(increment);
+        amount.value = String(defaultValue);
+        amount.disabled = true;
+        amount.setAttribute('aria-label', `${label} increment`);
+        activeToolGroup.appendChild(amount);
+        const update = () => {
+            snapSettings[key] = checkbox.checked;
+            snapSettings[stepKey] = Math.max(minimum, Number(amount.value) || defaultValue);
+            amount.value = String(snapSettings[stepKey]);
+            amount.disabled = !checkbox.checked;
+            options.onSetSnap?.({ ...snapSettings });
+        };
+        checkbox.addEventListener('change', update);
+        amount.addEventListener('change', update);
+    };
+    addSnapControl('position', 'Position snap', 'positionStep', 0.5, 0.001, 0.1);
+    addSnapControl('rotation', 'Rotation snap', 'rotationStep', 15, 1, 1);
+    addSnapControl('scale', 'Scale snap', 'scaleStep', 0.1, 0.001, 0.05);
+
+    group('Camera');
+    const cameraButtons = new Map();
+    [['Perspective', 'perspective'], ['Front', 'front'], ['Back', 'back'], ['Left', 'left'], ['Right', 'right'], ['Top', 'top'], ['Bottom', 'bottom']].forEach(([label, view]) => {
+        cameraButtons.set(view, button(label, () => {
+            cameraButtons.forEach((element, key) => element.classList.toggle('selected', key === view));
+            options.onSetCameraView?.(view);
+        }));
+    });
+    cameraButtons.get('perspective').classList.add('selected');
+
+    group('Display');
+    const renderButtons = new Map();
+    [['Wireframe', 'wireframe'], ['Solid', 'solid'], ['Material', 'material'], ['Anime', 'anime']].forEach(([label, mode]) => {
+        renderButtons.set(mode, button(label, () => {
+            renderButtons.forEach((element, key) => element.classList.toggle('selected', key === mode));
+            options.onSetRenderMode?.(mode);
+        }));
+    });
+    renderButtons.get('anime').classList.add('selected');
 
     group('View & Scene');
     button('Center View', onResetCamera);
@@ -691,6 +797,8 @@ export function createUI(root, options) {
         modeButton.dataset.pickMode = mode;
         modeButton.addEventListener('click', () => {
             onSetPickMode(mode);
+            options.onSetTransformTool?.('select');
+            transformButtons.forEach((element, key) => element.classList.toggle('selected', key === 'select'));
             container.classList.toggle('uv-mode', mode === 'mesh');
             if (mode === 'mesh') drawUvWorkspace();
             toolbar.querySelectorAll('[data-pick-mode]').forEach(button => button.classList.toggle('selected', button.dataset.pickMode === mode));
@@ -894,6 +1002,11 @@ export function createUI(root, options) {
         refreshBones: bones.refresh,
         setInternalFps: (fps, frameMs) => { fpsReadout.textContent = `Internal FPS ${Math.round(fps)} | ${frameMs.toFixed(2)} ms`; },
         setPolygonCount: (current, total) => { polygonReadout.textContent = `Current Mesh Polygons / All Polygons: ${current} / ${total}`; },
+        setViewportStats: stats => {
+            if (!stats) return;
+            viewportStats.textContent = `Draw calls ${stats.drawCalls} | Triangles ${stats.triangles} | Objects ${stats.objects}`;
+        },
+        setCameraView: view => cameraButtons.forEach((element, key) => element.classList.toggle('selected', key === view)),
         refreshTextures: () => { assets.refresh(); inspector.refresh(); refreshUvTextures(); },
         refreshPrefabs: assets.refreshPrefabs,
         refreshScenes,

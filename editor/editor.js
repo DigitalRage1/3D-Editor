@@ -61,6 +61,12 @@ export class Editor {
             onSelect: (mesh, additive) => this.select(mesh, { additive }),
             onSelectFace: faceIndex => this.selectFace(faceIndex),
             onSetPickMode: mode => this.gizmos.setPickMode(mode),
+            onSetTransformTool: tool => this.gizmos.setTransformTool(tool),
+            onSetTransformSpace: space => this.gizmos.setTransformSpace(space),
+            onSetAxisLock: axis => this.gizmos.setAxisConstraint(axis),
+            onSetSnap: settings => this.gizmos.setSnap(settings),
+            onSetCameraView: view => this.setCameraView(view),
+            onSetRenderMode: mode => this.renderer.setRenderMode(mode),
             onAddCube: () => this.addCube(),
             onAddPlane: () => this.addPrimitive('Plane'),
             onAddSphere: () => this.addPrimitive('Sphere'),
@@ -72,6 +78,20 @@ export class Editor {
             onMergeFace: () => this.mergeSelectedFace(),
             onMergeVertices: () => this.mergeSelectedVertices(),
             onAddVertex: () => this.addVertex(),
+            onKnifeTool: () => this.knifeTool(),
+            onBevel: () => this.bevelSelected(),
+            onInset: () => this.insetSelected(),
+            onLoopCut: () => this.loopCutSelected(),
+            onBridge: () => this.bridgeSelected(),
+            onFill: () => this.fillSelected(),
+            onGridFill: () => this.gridFillSelected(),
+            onDissolve: () => this.dissolveSelected(),
+            onSplit: () => this.splitSelected(),
+            onSeparate: () => this.separateSelected(),
+            onTriangulate: () => this.triangulateSelected(),
+            onQuadRebuild: () => this.quadRebuildSelected(),
+            onRecalculateNormals: () => this.recalculateNormalsSelected(),
+            onFlipNormals: () => this.flipNormalsSelected(),
             onAddBone: parentIndex => this.addBone(parentIndex),
             onRemoveBone: index => this.removeBone(index),
             onCreateAnimation: () => this.createAnimation(),
@@ -104,7 +124,13 @@ export class Editor {
                 this.ui.setSelected(mesh);
             },
             onHistoryStart: () => this.snapshotScene(),
-            onHistoryEnd: snapshot => this.recordHistorySnapshot(snapshot)
+            onHistoryEnd: snapshot => this.recordHistorySnapshot(snapshot),
+            onCameraViewChange: view => this.ui.setCameraView(view),
+            onTransform: mesh => {
+                this.refreshSceneAssets();
+                this.ui.setSelected(mesh);
+                this.ui.refreshHierarchy();
+            }
         });
 
         this.selected = null;
@@ -117,6 +143,7 @@ export class Editor {
         this.ui.updateAnimationWorkspace(this.selected?.animationPlayer.time || 0, this.selected?.animationPlayer.playing || false);
         const allPolygons = this.scene.meshes.reduce((sum, mesh) => sum + mesh.faceCount, 0);
         this.ui.setPolygonCount(this.selected?.faceCount || 0, allPolygons);
+        this.ui.setViewportStats(this.renderer.frameStats);
     }
 
     async initializeScenes() {
@@ -418,6 +445,7 @@ export class Editor {
             this.selected = mesh;
         }
         if (mesh) mesh.selectedFace = mesh.selectedFace < 0 ? 0 : mesh.selectedFace;
+        this.gizmos?.setSelected(this.selected);
         this.ui.setSelected(this.selected);
         this.ui.refreshHierarchy();
     }
@@ -621,6 +649,106 @@ export class Editor {
         this.recordHistory();
         this.selected.addVertex(faceIndex, [0, 0, 0]);
         this.ui.setSelected(this.selected);
+    }
+
+    knifeTool() {
+        if (!this.selected || this.selected.selectedFace < 0) return;
+        this.recordHistory();
+        this.selected.knifeTool(this.selected.selectedFace, [0, 0, 0], [1, 0, 0]);
+        this.ui.setSelected(this.selected);
+    }
+
+    bevelSelected() {
+        if (!this.selected || this.selected.selectedFace < 0) return;
+        this.recordHistory();
+        this.selected.bevel(this.selected.selectedFace, 0.1);
+        this.ui.setSelected(this.selected);
+    }
+
+    insetSelected() {
+        if (!this.selected || this.selected.selectedFace < 0) return;
+        this.recordHistory();
+        this.selected.inset(this.selected.selectedFace, 0.2);
+        this.ui.setSelected(this.selected);
+    }
+
+    loopCutSelected() {
+        if (!this.selected || this.selected.selectedFace < 0) return;
+        this.recordHistory();
+        this.selected.loopCut(this.selected.selectedFace, 2);
+        this.ui.setSelected(this.selected);
+    }
+
+    bridgeSelected() {
+        if (!this.selected || this.selected.faceCount < 2) return;
+        this.recordHistory();
+        const source = Math.max(0, this.selected.selectedFace);
+        const target = Math.min(this.selected.faceCount - 1, source + 1);
+        this.selected.bridge(source, target);
+        this.ui.setSelected(this.selected);
+    }
+
+    fillSelected() {
+        if (!this.selected || this.selected.selectedFace < 0) return;
+        this.recordHistory();
+        this.selected.fill(this.selected.selectedFace);
+        this.ui.setSelected(this.selected);
+    }
+
+    gridFillSelected() {
+        if (!this.selected || this.selected.selectedFace < 0) return;
+        this.recordHistory();
+        this.selected.gridFill(this.selected.selectedFace, 2, 2);
+        this.ui.setSelected(this.selected);
+    }
+
+    dissolveSelected() {
+        if (!this.selected || this.selected.selectedFace < 0) return;
+        this.recordHistory();
+        this.selected.dissolve(this.selected.selectedFace);
+        this.ui.setSelected(this.selected);
+    }
+
+    splitSelected() {
+        if (!this.selected || this.selected.selectedFace < 0) return;
+        this.recordHistory();
+        const splitMesh = this.selected.split(this.selected.selectedFace, 'x');
+        if (splitMesh) this.scene.add(splitMesh);
+        this.ui.refreshHierarchy();
+    }
+
+    separateSelected() {
+        if (!this.selected || this.selected.selectedFace < 0) return;
+        this.recordHistory();
+        const separated = this.selected.separate(this.selected.selectedFace);
+        if (separated) this.scene.add(separated);
+        this.ui.refreshHierarchy();
+    }
+
+    triangulateSelected() {
+        if (!this.selected || this.selected.selectedFace < 0) return;
+        this.recordHistory();
+        this.selected.triangulate(this.selected.selectedFace);
+        this.ui.setSelected(this.selected);
+    }
+
+    quadRebuildSelected() {
+        if (!this.selected || this.selected.selectedFace < 0) return;
+        this.recordHistory();
+        this.selected.quadRebuild(this.selected.selectedFace);
+        this.ui.setSelected(this.selected);
+    }
+
+    recalculateNormalsSelected() {
+        if (!this.selected) return;
+        this.recordHistory();
+        this.selected.recalculateNormals();
+    }
+
+    flipNormalsSelected() {
+        if (!this.selected) return;
+        this.recordHistory();
+        this.selected.flipNormals();
     }
 
     addBone(parentIndex = null) {
@@ -1000,9 +1128,17 @@ export class Editor {
     }
 
     resetCamera() {
+        this.camera.setViewMode('perspective');
         this.camera.position = [0, 1.5, 4];
         this.camera.target = [0, 0.5, 0];
         this.gizmos.syncFromCamera();
+        this.ui.setCameraView('perspective');
+    }
+
+    setCameraView(view) {
+        this.camera.setViewMode(view);
+        this.gizmos.syncFromCamera();
+        this.ui.setCameraView(view);
     }
 
     snapshotScene() {

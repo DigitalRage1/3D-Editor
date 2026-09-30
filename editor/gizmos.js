@@ -19,6 +19,7 @@ export class Gizmos {
         this.transformDrag = null;
         this.activeButton = 0;
         this.axisConstraint = null;
+        this.modifierSelection = false;
         this.distance = Math.hypot(...camera.position);
         this.yaw = Math.atan2(camera.position[0], camera.position[2]);
         this.pitch = Math.asin(camera.position[1] / this.distance);
@@ -49,6 +50,7 @@ export class Gizmos {
             this.lastX = event.clientX;
             this.lastY = event.clientY;
             this.moved = false;
+            this.modifierSelection = event.shiftKey || event.ctrlKey || event.metaKey;
             const handle = event.button === 0 ? this.hitTransformHandle(event.clientX, event.clientY) : null;
             if (handle) {
                 this.transformDrag = this.beginTransformDrag(handle, event.clientX, event.clientY);
@@ -59,8 +61,10 @@ export class Gizmos {
                 return;
             }
             this.transformDrag = null;
-            this.activePick = event.button === 0 && !event.shiftKey ? this.pick(event.clientX, event.clientY) : null;
-            this.historySnapshot = this.activePick && this.pickMode !== 'orbit' && this.transformTool === 'select'
+            this.activePick = event.button === 0 && this.pickMode !== 'orbit'
+                ? this.pick(event.clientX, event.clientY, { additive: this.modifierSelection })
+                : null;
+            this.historySnapshot = this.activePick && !this.modifierSelection && this.transformTool === 'select'
                 ? this.callbacks.onHistoryStart?.()
                 : null;
             this.canvas.setPointerCapture(event.pointerId);
@@ -72,10 +76,10 @@ export class Gizmos {
             this.moved = this.moved || Math.abs(deltaX) + Math.abs(deltaY) > 2;
             if (this.transformDrag) {
                 this.applyTransform(event.clientX, event.clientY);
-            } else if ((this.activeButton === 1 || event.shiftKey) && this.activeButton !== 2) {
+            } else if (this.activeButton === 1 || (this.activeButton === 0 && event.shiftKey && !this.activePick)) {
                 this.panCamera(deltaX, deltaY);
             } else if (this.activeButton === 0 && this.activePick) {
-                if (this.transformTool === 'select' && this.pickMode !== 'orbit') this.dragSelection(deltaX, deltaY);
+                if (this.transformTool === 'select' && this.pickMode !== 'orbit' && !this.modifierSelection) this.dragSelection(deltaX, deltaY);
             } else {
                 if (this.camera.viewMode !== 'perspective') {
                     this.camera.setViewMode('perspective');
@@ -91,7 +95,6 @@ export class Gizmos {
         this.canvas.addEventListener('pointerup', event => {
             this.dragging = false;
             if (this.canvas.hasPointerCapture(event.pointerId)) this.canvas.releasePointerCapture(event.pointerId);
-            if (!this.transformDrag && !this.moved && this.activeButton === 0 && !event.shiftKey) this.pick(event.clientX, event.clientY);
             if (this.historySnapshot) this.callbacks.onHistoryEnd?.(this.historySnapshot);
             if (this.transformDrag) this.callbacks.onTransform?.(this.transformDrag.mesh);
             this.historySnapshot = null;
@@ -350,9 +353,6 @@ export class Gizmos {
             return;
         }
         const localDelta = transformDirectionInverse(pick.mesh.getModelMatrix(), worldDelta);
-        const vertices = this.pickMode === 'face'
-            ? pick.mesh.polygons[pick.faceIndex]
-            : [pick.mesh.polygons[pick.faceIndex][pick.vertexIndex]];
         if (this.pickMode === 'vertex') {
             const position = [...pick.vertexPosition];
             for (let axis = 0; axis < 3; axis++) position[axis] += localDelta[axis];
@@ -360,8 +360,12 @@ export class Gizmos {
             pick.vertexPosition = position;
             return;
         }
+        const vertices = this.pickMode === 'edge'
+            ? [pick.mesh.positions[pick.a], pick.mesh.positions[pick.b]]
+            : pick.mesh.polygons[pick.faceIndex];
         vertices.forEach(vertex => {
             for (let axis = 0; axis < 3; axis++) vertex[axis] += localDelta[axis];
+            pick.mesh.updateBindVertex(vertex);
         });
         pick.mesh.rebuildRenderData();
     }
@@ -399,7 +403,7 @@ export class Gizmos {
         return [clip[0] / clip[3], clip[1] / clip[3]];
     }
 
-    pick(clientX, clientY) {
+    pick(clientX, clientY, modifiers = { additive: false }) {
         const rect = this.canvas.getBoundingClientRect();
         const x = ((clientX - rect.left) / rect.width) * 2 - 1;
         const y = 1 - ((clientY - rect.top) / rect.height) * 2;
@@ -426,7 +430,15 @@ export class Gizmos {
                 }
             });
         }
-        if (!hit) return null;
+        if (!hit) {
+            this.callbacks.onPickEmpty?.(modifiers);
+            return null;
+        }
+
+        if (this.pickMode === 'mesh') {
+            this.callbacks.onPickMesh?.(hit.mesh, modifiers);
+            return hit;
+        }
 
         if (this.pickMode === 'vertex') {
             const polygon = hit.mesh.polygons[hit.faceIndex];
@@ -441,12 +453,38 @@ export class Gizmos {
                 }
             });
             if (nearestVertex) {
-                this.callbacks.onPickVertex?.(nearestVertex.mesh, nearestVertex.faceIndex, nearestVertex.vertexIndex);
+                this.callbacks.onPickVertex?.(nearestVertex.mesh, nearestVertex.faceIndex, nearestVertex.vertexIndex, modifiers);
                 return nearestVertex;
             }
         }
 
-        this.callbacks.onPickFace?.(hit.mesh, hit.faceIndex);
+        if (this.pickMode === 'edge') {
+            const face = hit.mesh.faces[hit.faceIndex];
+            let nearestEdge = null;
+            let nearestDistance = 12;
+            face.forEach((a, corner) => {
+                const b = face[(corner + 1) % face.length];
+                const projectedA = this.project(hit.mesh.positions[a], hit.mesh.getModelMatrix());
+                const projectedB = this.project(hit.mesh.positions[b], hit.mesh.getModelMatrix());
+                const start = [(projectedA[0] + 1) * rect.width * 0.5, (1 - projectedA[1]) * rect.height * 0.5];
+                const end = [(projectedB[0] + 1) * rect.width * 0.5, (1 - projectedB[1]) * rect.height * 0.5];
+                const pointer = [clientX - rect.left, clientY - rect.top];
+                const distance = distanceToSegment(pointer, start, end);
+                if (distance < nearestDistance) {
+                    nearestDistance = distance;
+                    nearestEdge = { a: Math.min(a, b), b: Math.max(a, b) };
+                }
+            });
+            if (nearestEdge) {
+                const edgeKey = `${nearestEdge.a},${nearestEdge.b}`;
+                this.callbacks.onPickEdge?.(hit.mesh, hit.faceIndex, edgeKey, nearestEdge.a, nearestEdge.b, modifiers);
+                return { ...hit, ...nearestEdge, edgeKey, edge: true };
+            }
+            this.callbacks.onPickEmpty?.(modifiers);
+            return null;
+        }
+
+        this.callbacks.onPickFace?.(hit.mesh, hit.faceIndex, modifiers);
         return hit;
     }
 

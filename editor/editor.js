@@ -8,6 +8,8 @@ import { SceneManager } from '../engine/sceneManager.js';
 import { AssetManager } from '../engine/assetManager.js';
 import { PrefabManager } from '../engine/prefabManager.js';
 import { TextureLibrary } from './textureLibrary.js';
+import { SelectionModel } from './selection.js';
+import { executeMeshCommand } from './ops/meshCommands.js';
 
 export class Editor {
     constructor(scene, camera, renderer) {
@@ -27,7 +29,11 @@ export class Editor {
             loadSubScene: (sceneId, data) => this.loadSubSceneData(sceneId, data),
             unloadSubScene: sceneId => this.unloadSubSceneData(sceneId)
         });
-        this.selectedMeshes = new Set();
+        this.selection = new SelectionModel('face');
+        this.selectedMeshes = this.selection.selectedMeshes;
+        this.selectedFaces = this.selection.selectedFaces;
+        this.selectedEdges = this.selection.selectedEdges;
+        this.selectedVertices = this.selection.selectedVertices;
 
         this.uiRoot = document.getElementById('ui-root');
         this.ui = createUI(this.uiRoot, {
@@ -60,7 +66,7 @@ export class Editor {
             },
             onSelect: (mesh, additive) => this.select(mesh, { additive }),
             onSelectFace: faceIndex => this.selectFace(faceIndex),
-            onSetPickMode: mode => this.gizmos.setPickMode(mode),
+            onSetPickMode: mode => this.setSelectionMode(mode),
             onSetTransformTool: tool => this.gizmos.setTransformTool(tool),
             onSetTransformSpace: space => this.gizmos.setTransformSpace(space),
             onSetAxisLock: axis => this.gizmos.setAxisConstraint(axis),
@@ -112,17 +118,14 @@ export class Editor {
             onHistory: () => this.recordHistory()
         });
         this.gizmos = new Gizmos(scene, camera, renderer.canvas, {
-            onPickFace: (mesh, faceIndex) => {
-                mesh.selectedVertex = null;
-                this.select(mesh);
-                this.selectFace(faceIndex);
+            onPickMesh: (mesh, modifiers) => this.select(mesh, { additive: modifiers.additive }),
+            onPickFace: (mesh, faceIndex, modifiers) => this.selectElement(mesh, 'face', faceIndex, { faceIndex }, modifiers),
+            onPickEdge: (mesh, faceIndex, edgeKey, a, b, modifiers) => this.selectElement(mesh, 'edge', edgeKey, { faceIndex, a, b }, modifiers),
+            onPickVertex: (mesh, faceIndex, vertexIndex, modifiers) => {
+                const sharedVertexIndex = mesh.faces[faceIndex]?.[vertexIndex];
+                this.selectElement(mesh, 'vertex', sharedVertexIndex, { faceIndex, vertexIndex }, modifiers);
             },
-            onPickVertex: (mesh, faceIndex, vertexIndex) => {
-                this.select(mesh);
-                this.selectFace(faceIndex);
-                mesh.selectedVertex = { faceIndex, vertexIndex };
-                this.ui.setSelected(mesh);
-            },
+            onPickEmpty: modifiers => { if (!modifiers.additive) this.select(null); },
             onHistoryStart: () => this.snapshotScene(),
             onHistoryEnd: snapshot => this.recordHistorySnapshot(snapshot),
             onCameraViewChange: view => this.ui.setCameraView(view),
@@ -452,27 +455,46 @@ export class Editor {
     }
 
     select(mesh, { additive = false } = {}) {
-        if (additive && mesh) {
-            if (this.selectedMeshes.has(mesh)) this.selectedMeshes.delete(mesh);
-            else this.selectedMeshes.add(mesh);
-            if (this.selected === mesh) this.selected = [...this.selectedMeshes].at(-1) || null;
-            else if (this.selectedMeshes.has(mesh)) this.selected = mesh;
-        } else {
-            this.selectedMeshes.clear();
-            if (mesh) this.selectedMeshes.add(mesh);
-            this.selected = mesh;
-        }
-        if (mesh) mesh.selectedFace = mesh.selectedFace < 0 ? 0 : mesh.selectedFace;
+        const previous = this.selected;
+        this.selected = this.selection.selectMesh(mesh, { additive });
+        if (previous && previous !== this.selected) previous.selectedVertex = null;
+        if (this.selected) this.selected.selectedFace = this.selected.selectedFace < 0 ? 0 : this.selected.selectedFace;
         this.gizmos?.setSelected(this.selected);
         this.ui.setSelected(this.selected);
         this.ui.refreshHierarchy();
     }
 
     selectMeshes(meshes) {
-        this.selectedMeshes.clear();
-        meshes.forEach(mesh => this.selectedMeshes.add(mesh));
-        this.selected = meshes.at(-1) || null;
+        const previous = this.selected;
+        this.selected = this.selection.selectMeshes(meshes);
+        if (previous && previous !== this.selected) previous.selectedVertex = null;
+        this.gizmos?.setSelected(this.selected);
         this.ui.setSelected(this.selected);
+        this.ui.refreshHierarchy();
+    }
+
+    setSelectionMode(mode) {
+        if (mode !== 'orbit') this.selection.setMode(mode);
+        this.gizmos?.setPickMode(mode);
+    }
+
+    selectElement(mesh, mode, value, details = {}, { additive = false } = {}) {
+        const previous = this.selected;
+        this.selection.selectElement(mesh, mode, value, details, { additive });
+        this.selected = mesh;
+        if (previous && previous !== mesh) previous.selectedVertex = null;
+        const active = this.selection.active;
+        mesh.selectedVertex = active?.mesh === mesh && active.mode === 'vertex'
+            ? { faceIndex: active.faceIndex, vertexIndex: active.vertexIndex }
+            : null;
+        if (active?.mesh === mesh && Number.isInteger(active.faceIndex)) {
+            mesh.selectedFace = active.faceIndex;
+        } else if (mode === 'face') {
+            mesh.selectedFace = -1;
+        }
+        this.gizmos?.setSelected(mesh);
+        this.ui.setSelected(mesh);
+        this.ui.setFace(mesh.selectedFace);
         this.ui.refreshHierarchy();
     }
 
@@ -621,152 +643,204 @@ export class Editor {
         return replacement;
     }
 
-    selectFace(faceIndex) {
-        if (!this.selected) return;
-        this.selected.selectedVertex = null;
-        this.selected.selectedFace = faceIndex;
-        this.ui.setFace(faceIndex);
+    selectFace(faceIndex, { additive = false, mesh = this.selected } = {}) {
+        if (!mesh) return;
+        this.selectElement(mesh, 'face', faceIndex, { faceIndex }, { additive });
+    }
+
+    getSelectedFaceIndices(mesh = this.selected) {
+        if (!mesh) return [];
+        const selected = [...this.selectedFaces].filter(index => index >= 0 && index < mesh.faceCount);
+        if (selected.length) return selected;
+        return mesh.selectedFace >= 0 && mesh.selectedFace < mesh.faceCount ? [mesh.selectedFace] : [];
+    }
+
+    finishMeshEditSelection(mesh) {
+        this.selection.clearElements();
+        mesh.selectedVertex = null;
+        if (mesh.faceCount) {
+            const faceIndex = Math.max(0, Math.min(mesh.selectedFace, mesh.faceCount - 1));
+            mesh.selectedFace = faceIndex;
+            this.selectedFaces.add(faceIndex);
+            this.selection.active = { mode: 'face', mesh, value: faceIndex, faceIndex };
+        } else {
+            mesh.selectedFace = -1;
+            this.selection.active = { mode: 'mesh', mesh };
+        }
+        this.selected = mesh;
+        this.gizmos?.setSelected(mesh);
+        this.ui.setSelected(mesh);
+        this.ui.setFace(mesh.selectedFace);
+    }
+
+    runSelectedFaceOperator(label, operator) {
+        const mesh = this.selected;
+        const faceIndices = this.getSelectedFaceIndices(mesh).sort((a, b) => b - a);
+        if (!mesh || !faceIndices.length) {
+            this.ui.setStatus('Select a face first');
+            return false;
+        }
+        const targetFaces = faceIndices.map(faceIndex => mesh.faces[faceIndex]?.join(',')).filter(Boolean);
+        const changed = executeMeshCommand(this, mesh, label, () => {
+            targetFaces.forEach(faceSignature => {
+                const faceIndex = mesh.faces.findIndex(face => face.join(',') === faceSignature);
+                if (faceIndex >= 0) operator(mesh, faceIndex);
+            });
+        });
+        if (changed) this.finishMeshEditSelection(mesh);
+        return changed;
     }
 
     addFace() {
-        if (!this.selected) return;
-        this.recordHistory();
-        this.selected.addFace([[0, 0, 0], [1, 0, 0], [0, 1, 0]]);
-        this.selectFace(this.selected.faceCount - 1);
+        if (!this.selected) {
+            this.ui.setStatus('Select a mesh first');
+            return;
+        }
+        const mesh = this.selected;
+        if (executeMeshCommand(this, mesh, 'Add Face', () => mesh.addFace([[0, 0, 0], [1, 0, 0], [0, 1, 0]]))) {
+            this.finishMeshEditSelection(mesh);
+        }
     }
 
     extrudeFace() {
-        if (!this.selected) return;
-        this.recordHistory();
-        this.selected.extrudeFace(Math.max(0, this.selected.selectedFace));
-        this.selectFace(this.selected.selectedFace);
+        this.runSelectedFaceOperator('Extrude', (mesh, faceIndex) => mesh.extrudeFace(faceIndex));
     }
 
     mergeSelectedFace() {
-        if (!this.selected) return;
-        this.recordHistory();
-        if (this.selected.mergeCoplanarFace(Math.max(0, this.selected.selectedFace))) {
-            this.selected.selectedVertex = null;
-            this.selectFace(this.selected.selectedFace);
-        }
+        this.runSelectedFaceOperator('Merge Coplanar', (mesh, faceIndex) => mesh.mergeCoplanarFace(faceIndex));
     }
 
     mergeSelectedVertices() {
-        const selectedVertex = this.selected?.selectedVertex;
-        if (!selectedVertex) return;
-        this.recordHistory();
-        if (this.selected.mergeNearbyVertices(selectedVertex.faceIndex, selectedVertex.vertexIndex)) {
-            this.selected.selectedVertex = null;
-            this.ui.setSelected(this.selected);
+        const mesh = this.selected;
+        if (!mesh) return;
+        const selectedIndices = [...this.selectedVertices];
+        if (!selectedIndices.length && mesh.selectedVertex) {
+            const { faceIndex, vertexIndex } = mesh.selectedVertex;
+            selectedIndices.push(mesh.faces[faceIndex]?.[vertexIndex]);
         }
+        const positions = selectedIndices.map(index => mesh.positions[index]).filter(Boolean).map(position => [...position]);
+        if (!positions.length) {
+            this.ui.setStatus('Select a vertex first');
+            return;
+        }
+        if (executeMeshCommand(this, mesh, 'Merge Vertices', () => positions.forEach(position => {
+            const vertexIndex = mesh.positions.findIndex(candidate => Math.hypot(...candidate.map((value, axis) => value - position[axis])) < 1e-6);
+            if (vertexIndex < 0) return;
+            const faceIndex = mesh.faces.findIndex(face => face.includes(vertexIndex));
+            if (faceIndex < 0) return;
+            const cornerIndex = mesh.faces[faceIndex].indexOf(vertexIndex);
+            mesh.mergeNearbyVertices(faceIndex, cornerIndex);
+        }))) this.finishMeshEditSelection(mesh);
     }
 
     addVertex() {
-        if (!this.selected) return;
-        const faceIndex = Math.max(0, this.selected.selectedFace);
-        this.recordHistory();
-        this.selected.addVertex(faceIndex, [0, 0, 0]);
-        this.ui.setSelected(this.selected);
+        this.runSelectedFaceOperator('Add Vertex', (mesh, faceIndex) => mesh.addVertex(faceIndex, [0, 0, 0]));
     }
 
     knifeTool() {
-        if (!this.selected || this.selected.selectedFace < 0) return;
-        this.recordHistory();
-        this.selected.knifeTool(this.selected.selectedFace, [0, 0, 0], [1, 0, 0]);
-        this.ui.setSelected(this.selected);
+        this.runSelectedFaceOperator('Knife', (mesh, faceIndex) => mesh.knifeTool(faceIndex, [0, 0, 0], [1, 0, 0]));
     }
 
     bevelSelected() {
-        if (!this.selected || this.selected.selectedFace < 0) return;
-        this.recordHistory();
-        this.selected.bevel(this.selected.selectedFace, 0.1);
-        this.ui.setSelected(this.selected);
+        this.runSelectedFaceOperator('Bevel', (mesh, faceIndex) => mesh.bevel(faceIndex, 0.1));
     }
 
     insetSelected() {
-        if (!this.selected || this.selected.selectedFace < 0) return;
-        this.recordHistory();
-        this.selected.inset(this.selected.selectedFace, 0.2);
-        this.ui.setSelected(this.selected);
+        this.runSelectedFaceOperator('Inset', (mesh, faceIndex) => mesh.inset(faceIndex, 0.2));
     }
 
     loopCutSelected() {
-        if (!this.selected || this.selected.selectedFace < 0) return;
-        this.recordHistory();
-        this.selected.loopCut(this.selected.selectedFace, 2);
-        this.ui.setSelected(this.selected);
+        this.runSelectedFaceOperator('Loop Cut', (mesh, faceIndex) => mesh.loopCut(faceIndex, 2));
     }
 
     bridgeSelected() {
-        if (!this.selected || this.selected.faceCount < 2) return;
-        this.recordHistory();
-        const source = Math.max(0, this.selected.selectedFace);
-        const target = Math.min(this.selected.faceCount - 1, source + 1);
-        this.selected.bridge(source, target);
-        this.ui.setSelected(this.selected);
+        const mesh = this.selected;
+        const faces = this.getSelectedFaceIndices(mesh);
+        const source = faces[0];
+        const target = faces[1] ?? (source === undefined ? undefined : source + 1);
+        if (!mesh || target === undefined || target >= mesh.faceCount) {
+            this.ui.setStatus('Select two faces to bridge');
+            return;
+        }
+        if (executeMeshCommand(this, mesh, 'Bridge', () => mesh.bridge(source, target))) this.finishMeshEditSelection(mesh);
     }
 
     fillSelected() {
-        if (!this.selected || this.selected.selectedFace < 0) return;
-        this.recordHistory();
-        this.selected.fill(this.selected.selectedFace);
-        this.ui.setSelected(this.selected);
+        this.runSelectedFaceOperator('Fill', (mesh, faceIndex) => mesh.fill(faceIndex));
     }
 
     gridFillSelected() {
-        if (!this.selected || this.selected.selectedFace < 0) return;
-        this.recordHistory();
-        this.selected.gridFill(this.selected.selectedFace, 2, 2);
-        this.ui.setSelected(this.selected);
+        this.runSelectedFaceOperator('Grid Fill', (mesh, faceIndex) => mesh.gridFill(faceIndex, 2, 2));
     }
 
     dissolveSelected() {
-        if (!this.selected || this.selected.selectedFace < 0) return;
-        this.recordHistory();
-        this.selected.dissolve(this.selected.selectedFace);
-        this.ui.setSelected(this.selected);
+        this.runSelectedFaceOperator('Dissolve', (mesh, faceIndex) => mesh.dissolve(faceIndex));
     }
 
     splitSelected() {
-        if (!this.selected || this.selected.selectedFace < 0) return;
-        this.recordHistory();
-        const splitMesh = this.selected.split(this.selected.selectedFace, 'x');
-        if (splitMesh) this.scene.add(splitMesh);
+        const faceIndices = this.getSelectedFaceIndices();
+        if (!this.selected || !faceIndices.length) {
+            this.ui.setStatus('Select a face first');
+            return;
+        }
+        const snapshot = this.snapshotScene();
+        let changed = false;
+        faceIndices.forEach(faceIndex => {
+            const splitMesh = this.selected.split(faceIndex, 'x');
+            if (splitMesh) {
+                this.scene.add(splitMesh);
+                changed = true;
+            }
+        });
+        if (changed) this.recordHistorySnapshot(snapshot);
+        else this.ui.setStatus('Split: no change');
         this.ui.refreshHierarchy();
     }
 
     separateSelected() {
-        if (!this.selected || this.selected.selectedFace < 0) return;
-        this.recordHistory();
-        const separated = this.selected.separate(this.selected.selectedFace);
-        if (separated) this.scene.add(separated);
+        const faceIndices = this.getSelectedFaceIndices();
+        if (!this.selected || !faceIndices.length) {
+            this.ui.setStatus('Select a face first');
+            return;
+        }
+        const snapshot = this.snapshotScene();
+        let changed = false;
+        faceIndices.forEach(faceIndex => {
+            const separated = this.selected.separate(faceIndex);
+            if (separated) {
+                this.scene.add(separated);
+                changed = true;
+            }
+        });
+        if (changed) this.recordHistorySnapshot(snapshot);
+        else this.ui.setStatus('Separate: no change');
         this.ui.refreshHierarchy();
     }
 
     triangulateSelected() {
-        if (!this.selected || this.selected.selectedFace < 0) return;
-        this.recordHistory();
-        this.selected.triangulate(this.selected.selectedFace);
-        this.ui.setSelected(this.selected);
+        this.runSelectedFaceOperator('Triangulate', (mesh, faceIndex) => mesh.triangulate(faceIndex));
     }
 
     quadRebuildSelected() {
-        if (!this.selected || this.selected.selectedFace < 0) return;
-        this.recordHistory();
-        this.selected.quadRebuild(this.selected.selectedFace);
-        this.ui.setSelected(this.selected);
+        this.runSelectedFaceOperator('Quad Rebuild', (mesh, faceIndex) => mesh.quadRebuild(faceIndex));
     }
 
     recalculateNormalsSelected() {
-        if (!this.selected) return;
-        this.recordHistory();
-        this.selected.recalculateNormals();
+        if (!this.selected) {
+            this.ui.setStatus('Select a mesh first');
+            return;
+        }
+        const mesh = this.selected;
+        executeMeshCommand(this, mesh, 'Recalculate Normals', () => mesh.recalculateNormals());
     }
 
     flipNormalsSelected() {
-        if (!this.selected) return;
-        this.recordHistory();
-        this.selected.flipNormals();
+        if (!this.selected) {
+            this.ui.setStatus('Select a mesh first');
+            return;
+        }
+        const mesh = this.selected;
+        if (executeMeshCommand(this, mesh, 'Flip Normals', () => mesh.flipNormals())) this.finishMeshEditSelection(mesh);
     }
 
     addBone(parentIndex = null) {
@@ -1100,9 +1174,20 @@ export class Editor {
     }
 
     duplicateSelected() {
-        const source = this.selected;
-        if (!source) return;
+        const sources = [...this.selectedMeshes].filter(mesh => this.scene.meshes.includes(mesh));
+        if (!sources.length && this.selected) sources.push(this.selected);
+        if (!sources.length) {
+            this.ui.setStatus('Select one or more meshes first');
+            return;
+        }
         this.recordHistory();
+        const duplicates = sources.map(source => this.cloneMesh(source));
+        duplicates.forEach(duplicate => this.scene.add(duplicate));
+        this.refreshSceneAssets();
+        this.selectMeshes(duplicates);
+    }
+
+    cloneMesh(source) {
         const duplicate = new Mesh(Material.fromJSON({
             baseColor: [...source.material.baseColor],
             color: [...source.material.color],
@@ -1163,20 +1248,23 @@ export class Editor {
             if (track.boneName) track.times.forEach((time, index) => duplicate.animationClip.addBoneKeyframe(track.boneName, track.property, time, track.values[index]));
             else duplicate.animationClip.addTrack(track.property, [...track.times], track.values.map(value => [...value]));
         });
-        this.scene.add(duplicate);
-        this.refreshSceneAssets();
-        this.select(duplicate);
+        return duplicate;
     }
 
-    deleteSelected(mesh = this.selected) {
-        if (!mesh) return;
-        const index = this.scene.meshes.indexOf(mesh);
-        if (index < 0) return;
+    deleteSelected(mesh = null) {
+        const targets = (mesh ? [mesh] : [...this.selectedMeshes]).filter(item => this.scene.meshes.includes(item));
+        if (!targets.length && this.selected && this.scene.meshes.includes(this.selected)) targets.push(this.selected);
+        if (!targets.length) {
+            this.ui.setStatus('Select one or more meshes first');
+            return;
+        }
+        const firstIndex = Math.min(...targets.map(target => this.scene.meshes.indexOf(target)));
         this.recordHistory();
-        this.scene.remove(mesh);
+        targets.forEach(target => this.scene.remove(target));
         this.refreshSceneAssets();
-        if (mesh === this.selected) this.select(this.scene.meshes[Math.min(index, this.scene.meshes.length - 1)] || null);
-        else this.ui.refreshHierarchy();
+        const remainingSelection = [...this.selectedMeshes].filter(target => this.scene.meshes.includes(target));
+        if (remainingSelection.length) this.selectMeshes(remainingSelection);
+        else this.select(this.scene.meshes[Math.min(firstIndex, this.scene.meshes.length - 1)] || null);
     }
 
     reorderMesh(mesh, index) {
@@ -1310,17 +1398,46 @@ export class Editor {
     }
 
     async undo() {
-        const snapshot = this.undoStack.pop();
-        if (!snapshot) return;
+        const historyEntry = this.undoStack.pop();
+        if (!historyEntry) return;
+        if (historyEntry.type === 'mesh-edit') {
+            historyEntry.undo();
+            this.redoStack.push(historyEntry);
+            this.refreshAfterMeshCommand(historyEntry.mesh);
+            return;
+        }
         this.redoStack.push(this.snapshotScene());
-        await this.restoreHistorySnapshot(snapshot);
+        await this.restoreHistorySnapshot(historyEntry);
     }
 
     async redo() {
-        const snapshot = this.redoStack.pop();
-        if (!snapshot) return;
+        const historyEntry = this.redoStack.pop();
+        if (!historyEntry) return;
+        if (historyEntry.type === 'mesh-edit') {
+            historyEntry.redo();
+            this.undoStack.push(historyEntry);
+            this.refreshAfterMeshCommand(historyEntry.mesh);
+            return;
+        }
         this.undoStack.push(this.snapshotScene());
-        await this.restoreHistorySnapshot(snapshot);
+        await this.restoreHistorySnapshot(historyEntry);
+    }
+
+    refreshAfterMeshCommand(mesh) {
+        if (this.selected === mesh) {
+            this.selection.clearElements();
+            if (mesh.faceCount && mesh.selectedFace >= 0) {
+                this.selectedFaces.add(mesh.selectedFace);
+                this.selection.active = { mode: 'face', mesh, value: mesh.selectedFace, faceIndex: mesh.selectedFace };
+            } else {
+                this.selection.active = { mode: 'mesh', mesh };
+            }
+            this.ui.setSelected(mesh);
+            this.ui.setFace(mesh.selectedFace);
+        } else if (this.selected) {
+            this.ui.setSelected(this.selected);
+        }
+        this.ui.refreshHierarchy();
     }
 
     async serializeSceneData() {

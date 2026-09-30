@@ -19,6 +19,7 @@ export function createUI(root, options) {
         .internal-fps { position: fixed; right: 12px; bottom: 12px; z-index: 20; padding: 6px 9px; color: #bfe9d3; background: rgba(13, 23, 20, 0.92); border: 1px solid rgba(115, 190, 150, 0.45); font: 12px/1.3 ui-monospace, monospace; font-variant-numeric: tabular-nums; pointer-events: none; }
         .polygon-counter { position: fixed; right: 12px; bottom: 44px; z-index: 20; max-width: calc(100vw - 24px); padding: 6px 9px; color: #d7e8fa; background: rgba(15, 23, 34, 0.94); border: 1px solid rgba(130, 165, 202, 0.4); font: 12px/1.3 ui-monospace, monospace; font-variant-numeric: tabular-nums; pointer-events: none; }
         .viewport-stats { position: fixed; left: 12px; bottom: 12px; z-index: 20; padding: 6px 9px; color: #d7e8fa; background: rgba(15, 23, 34, 0.94); border: 1px solid rgba(130, 165, 202, 0.4); font: 12px/1.3 ui-monospace, monospace; font-variant-numeric: tabular-nums; pointer-events: none; }
+        .operator-status { position: fixed; left: 12px; bottom: 44px; z-index: 20; max-width: min(50vw, 420px); overflow: hidden; padding: 6px 9px; color: #d7e8fa; background: rgba(15, 23, 34, 0.94); border: 1px solid rgba(130, 165, 202, 0.4); font: 12px/1.3 ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }
         .editor-shell { position: fixed; inset: 0; z-index: 10; display: grid; grid-template-columns: minmax(210px, 18vw) minmax(0, 1fr) minmax(250px, 22vw); grid-template-rows: auto minmax(180px, 1fr) minmax(190px, 28vh); grid-template-areas: 'toolbar toolbar toolbar' 'hierarchy viewport inspector' 'assets assets animation'; box-sizing: border-box; overflow: hidden; pointer-events: none; }
         .editor-toolbar { grid-area: toolbar; display: flex; align-items: center; flex-wrap: wrap; gap: 5px; padding: 5px 8px; background: rgba(16, 20, 25, 0.98); border-bottom: 1px solid #343b43; pointer-events: auto; }
         .editor-toolbar-head { position: relative; display: flex; align-items: center; gap: 6px; min-height: 26px; }
@@ -135,6 +136,10 @@ export function createUI(root, options) {
     viewportStats.className = 'viewport-stats';
     viewportStats.textContent = 'Draw calls 0 | Triangles 0 | Objects 0';
     root.appendChild(viewportStats);
+    const operatorStatus = document.createElement('div');
+    operatorStatus.className = 'operator-status';
+    operatorStatus.textContent = 'Ready';
+    root.appendChild(operatorStatus);
     window.addEventListener('keydown', event => {
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
             event.preventDefault();
@@ -789,22 +794,35 @@ export function createUI(root, options) {
         if (uvCanvas.hasPointerCapture(event.pointerId)) uvCanvas.releasePointerCapture(event.pointerId);
     });
 
-    ['face', 'vertex', 'mesh', 'orbit'].forEach(mode => {
+    const modeLabels = new Map([['vertex', 'Vertex'], ['edge', 'Edge'], ['face', 'Face'], ['mesh', 'Object'], ['orbit', 'Orbit']]);
+    ['vertex', 'edge', 'face', 'mesh', 'orbit'].forEach(mode => {
         const modeButton = document.createElement('button');
         modeButton.className = 'editor-button' + (mode === 'face' ? ' selected' : '');
         modeButton.type = 'button';
-        modeButton.textContent = mode[0].toUpperCase() + mode.slice(1);
+        modeButton.textContent = modeLabels.get(mode);
         modeButton.dataset.pickMode = mode;
         modeButton.addEventListener('click', () => {
             onSetPickMode(mode);
             options.onSetTransformTool?.('select');
             transformButtons.forEach((element, key) => element.classList.toggle('selected', key === 'select'));
-            container.classList.toggle('uv-mode', mode === 'mesh');
-            if (mode === 'mesh') drawUvWorkspace();
+            container.classList.remove('uv-mode');
+            uvModeButton.classList.remove('selected');
             toolbar.querySelectorAll('[data-pick-mode]').forEach(button => button.classList.toggle('selected', button.dataset.pickMode === mode));
         });
         modeButtons.appendChild(modeButton);
     });
+    const uvModeButton = document.createElement('button');
+    uvModeButton.className = 'editor-button';
+    uvModeButton.type = 'button';
+    uvModeButton.textContent = 'UV';
+    uvModeButton.title = 'Toggle UV workspace';
+    uvModeButton.addEventListener('click', () => {
+        const active = !container.classList.contains('uv-mode');
+        container.classList.toggle('uv-mode', active);
+        uvModeButton.classList.toggle('selected', active);
+        if (active) drawUvWorkspace();
+    });
+    modeButtons.appendChild(uvModeButton);
     container.appendChild(toolbar);
     container.appendChild(uvWorkspace);
 
@@ -1006,6 +1024,7 @@ export function createUI(root, options) {
             if (!stats) return;
             viewportStats.textContent = `Draw calls ${stats.drawCalls} | Triangles ${stats.triangles} | Objects ${stats.objects}`;
         },
+        setStatus: message => { operatorStatus.textContent = message; },
         setCameraView: view => cameraButtons.forEach((element, key) => element.classList.toggle('selected', key === view)),
         refreshTextures: () => { assets.refresh(); inspector.refresh(); refreshUvTextures(); },
         refreshPrefabs: assets.refreshPrefabs,
@@ -1015,8 +1034,9 @@ export function createUI(root, options) {
         updateAnimationWorkspace: (time, playing) => bones.updatePlayback(time, playing),
         setPickMode: mode => {
             onSetPickMode(mode);
-            container.classList.toggle('uv-mode', mode === 'mesh');
-            if (mode === 'mesh') drawUvWorkspace();
+            container.classList.remove('uv-mode');
+            uvModeButton.classList.remove('selected');
+            toolbar.querySelectorAll('[data-pick-mode]').forEach(button => button.classList.toggle('selected', button.dataset.pickMode === mode));
         }
     };
 

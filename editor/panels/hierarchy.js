@@ -24,7 +24,7 @@ export function createHierarchyPanel(scene, { onSelect, onDelete, onReorder, get
             name.className = 'hierarchy-select';
             name.type = 'button';
             name.textContent = mesh.name || 'Mesh ' + i;
-            name.addEventListener('click', event => onSelect(mesh, event.ctrlKey || event.metaKey));
+            name.addEventListener('click', event => onSelect(mesh, event.shiftKey || event.ctrlKey || event.metaKey));
             const remove = document.createElement('button');
             remove.className = 'hierarchy-delete';
             remove.type = 'button';

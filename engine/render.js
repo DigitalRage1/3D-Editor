@@ -97,6 +97,12 @@ export class Renderer {
         const gl = this.gl;
         if (!this.program) return;
 
+        scene.meshes.forEach(mesh => {
+            if (mesh.dirtyFlags.geometry || mesh.dirtyFlags.uvs) mesh.rebuildRenderData();
+            else if (mesh.dirtyFlags.materials || mesh.dirtyFlags.selection) mesh.updateRenderQueues();
+        });
+        scene.consumeDirtyFlags?.();
+
         gl.clearColor(0.1, 0.1, 0.15, 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         gl.enable(gl.DEPTH_TEST);
@@ -214,13 +220,7 @@ export class Renderer {
         gl.uniform1f(this.uniforms.uInstanced, 1);
         gl.uniform1f(this.uniforms.uToonShading, this.renderMode === 'anime' && template.material.shading === 'toon' ? 1 : 0);
 
-        if (template.vertexWeights.size && template.skinningFrame !== frameId) {
-            gl.bindBuffer(gl.ARRAY_BUFFER, template.positionBuffer);
-            gl.bufferData(gl.ARRAY_BUFFER, template.getDeformedVertices(), gl.DYNAMIC_DRAW);
-            gl.bindBuffer(gl.ARRAY_BUFFER, template.normalBuffer);
-            gl.bufferData(gl.ARRAY_BUFFER, template.getDeformedNormals(), gl.DYNAMIC_DRAW);
-            template.skinningFrame = frameId;
-        }
+        if (template.vertexWeights.size || template.skinningSignature) template.updateSkinningBuffers(gl);
         const uniforms = template.getUniformLocations(gl, this.program);
         template.getDrawBatches(template.opaqueFaceIndices).forEach(batch => {
             gl.uniform4fv(uniforms.uColor, batch.color);
@@ -315,10 +315,13 @@ function makeShadowSignature(scene) {
         hash = Math.imul(hash ^ Math.round((Number(value) || 0) * 1e5), 16777619);
     };
     add(scene.meshes.length);
+    add(scene.geometryRevision);
     scene.light?.direction.forEach(add);
     scene.meshes.forEach(mesh => {
-        add(mesh.renderStateVersion);
+        add(mesh.geometryRevision);
+        for (const character of mesh.geometrySignature) add(character.charCodeAt(0));
         add(mesh.material.shading === 'toon' ? 1 : 0);
+        mesh.faceColors.forEach(color => add(color[3] ?? 1));
         mesh.position.forEach(add);
         mesh.rotation.forEach(add);
         mesh.scale.forEach(add);

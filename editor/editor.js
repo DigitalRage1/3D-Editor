@@ -9,7 +9,8 @@ import { AssetManager } from '../engine/assetManager.js';
 import { PrefabManager } from '../engine/prefabManager.js';
 import { TextureLibrary } from './textureLibrary.js';
 import { SelectionModel } from './selection.js';
-import { executeMeshCommand } from './ops/meshCommands.js';
+import { executeMeshCommand, executeSceneCommand } from './ops/meshCommands.js';
+import { runMeshOperator } from './ops/meshOperators.js';
 
 export class Editor {
     constructor(scene, camera, renderer) {
@@ -41,6 +42,12 @@ export class Editor {
             gl: renderer.gl,
             textureLibrary: this.textureLibrary,
             getSelectedItems: () => this.selectedMeshes,
+            getSelectionCounts: () => ({
+                meshes: this.selectedMeshes.size,
+                faces: this.selectedFaces.size,
+                edges: this.selectedEdges.size,
+                vertices: this.selectedVertices.size
+            }),
             prefabActions: {
                 list: () => this.prefabManager.list(),
                 create: name => this.createPrefab(name),
@@ -67,12 +74,22 @@ export class Editor {
             onSelect: (mesh, additive) => this.select(mesh, { additive }),
             onSelectFace: faceIndex => this.selectFace(faceIndex),
             onSetPickMode: mode => this.setSelectionMode(mode),
-            onSetTransformTool: tool => this.gizmos.setTransformTool(tool),
-            onSetTransformSpace: space => this.gizmos.setTransformSpace(space),
+            onSetTransformTool: tool => {
+                this.gizmos.setTransformTool(tool);
+                this.ui.setEditorState({ tool });
+            },
+            onSetTransformSpace: space => {
+                this.gizmos.setTransformSpace(space);
+                this.ui.setEditorState({ space });
+            },
             onSetAxisLock: axis => this.gizmos.setAxisConstraint(axis),
-            onSetSnap: settings => this.gizmos.setSnap(settings),
+            onSetSnap: settings => {
+                this.gizmos.setSnap(settings);
+                this.ui.setEditorState({ snap: settings });
+            },
             onSetCameraView: view => this.setCameraView(view),
             onSetRenderMode: mode => this.renderer.setRenderMode(mode),
+            onBonePoseChange: () => this.selected?.markDirty('skeletonPose'),
             onAddCube: () => this.addCube(),
             onAddPlane: () => this.addPrimitive('Plane'),
             onAddSphere: () => this.addPrimitive('Sphere'),
@@ -144,6 +161,7 @@ export class Editor {
         this.gizmos.update();
         this.ui.updateUvWorkspace();
         this.ui.updateAnimationWorkspace(this.selected?.animationPlayer.time || 0, this.selected?.animationPlayer.playing || false);
+        this.ui.refreshStatus();
         const allPolygons = this.scene.meshes.reduce((sum, mesh) => sum + mesh.faceCount, 0);
         this.ui.setPolygonCount(this.selected?.faceCount || 0, allPolygons);
         this.ui.setViewportStats(this.renderer.frameStats);
@@ -476,6 +494,7 @@ export class Editor {
     setSelectionMode(mode) {
         if (mode !== 'orbit') this.selection.setMode(mode);
         this.gizmos?.setPickMode(mode);
+        this.ui?.setEditorState({ mode });
     }
 
     selectElement(mesh, mode, value, details = {}, { additive = false } = {}) {
@@ -673,7 +692,7 @@ export class Editor {
         this.ui.setFace(mesh.selectedFace);
     }
 
-    runSelectedFaceOperator(label, operator) {
+    runSelectedFaceOperator(name, label, ...args) {
         const mesh = this.selected;
         const faceIndices = this.getSelectedFaceIndices(mesh).sort((a, b) => b - a);
         if (!mesh || !faceIndices.length) {
@@ -684,7 +703,7 @@ export class Editor {
         const changed = executeMeshCommand(this, mesh, label, () => {
             targetFaces.forEach(faceSignature => {
                 const faceIndex = mesh.faces.findIndex(face => face.join(',') === faceSignature);
-                if (faceIndex >= 0) operator(mesh, faceIndex);
+                if (faceIndex >= 0) runMeshOperator(mesh, name, faceIndex, ...args);
             });
         });
         if (changed) this.finishMeshEditSelection(mesh);
@@ -697,17 +716,17 @@ export class Editor {
             return;
         }
         const mesh = this.selected;
-        if (executeMeshCommand(this, mesh, 'Add Face', () => mesh.addFace([[0, 0, 0], [1, 0, 0], [0, 1, 0]]))) {
+        if (executeMeshCommand(this, mesh, 'Add Face', () => runMeshOperator(mesh, 'addFace', [[0, 0, 0], [1, 0, 0], [0, 1, 0]]))) {
             this.finishMeshEditSelection(mesh);
         }
     }
 
     extrudeFace() {
-        this.runSelectedFaceOperator('Extrude', (mesh, faceIndex) => mesh.extrudeFace(faceIndex));
+        this.runSelectedFaceOperator('extrude', 'Extrude');
     }
 
     mergeSelectedFace() {
-        this.runSelectedFaceOperator('Merge Coplanar', (mesh, faceIndex) => mesh.mergeCoplanarFace(faceIndex));
+        this.runSelectedFaceOperator('mergeCoplanar', 'Merge Coplanar');
     }
 
     mergeSelectedVertices() {
@@ -729,28 +748,28 @@ export class Editor {
             const faceIndex = mesh.faces.findIndex(face => face.includes(vertexIndex));
             if (faceIndex < 0) return;
             const cornerIndex = mesh.faces[faceIndex].indexOf(vertexIndex);
-            mesh.mergeNearbyVertices(faceIndex, cornerIndex);
+            runMeshOperator(mesh, 'mergeVertices', faceIndex, cornerIndex);
         }))) this.finishMeshEditSelection(mesh);
     }
 
     addVertex() {
-        this.runSelectedFaceOperator('Add Vertex', (mesh, faceIndex) => mesh.addVertex(faceIndex, [0, 0, 0]));
+        this.runSelectedFaceOperator('addVertex', 'Add Vertex', [0, 0, 0]);
     }
 
     knifeTool() {
-        this.runSelectedFaceOperator('Knife', (mesh, faceIndex) => mesh.knifeTool(faceIndex, [0, 0, 0], [1, 0, 0]));
+        this.runSelectedFaceOperator('knife', 'Knife', [0, 0, 0], [1, 0, 0]);
     }
 
     bevelSelected() {
-        this.runSelectedFaceOperator('Bevel', (mesh, faceIndex) => mesh.bevel(faceIndex, 0.1));
+        this.runSelectedFaceOperator('bevel', 'Bevel', 0.1);
     }
 
     insetSelected() {
-        this.runSelectedFaceOperator('Inset', (mesh, faceIndex) => mesh.inset(faceIndex, 0.2));
+        this.runSelectedFaceOperator('inset', 'Inset', 0.2);
     }
 
     loopCutSelected() {
-        this.runSelectedFaceOperator('Loop Cut', (mesh, faceIndex) => mesh.loopCut(faceIndex, 2));
+        this.runSelectedFaceOperator('loopCut', 'Loop Cut', 2);
     }
 
     bridgeSelected() {
@@ -762,19 +781,19 @@ export class Editor {
             this.ui.setStatus('Select two faces to bridge');
             return;
         }
-        if (executeMeshCommand(this, mesh, 'Bridge', () => mesh.bridge(source, target))) this.finishMeshEditSelection(mesh);
+        if (executeMeshCommand(this, mesh, 'Bridge', () => runMeshOperator(mesh, 'bridge', source, target))) this.finishMeshEditSelection(mesh);
     }
 
     fillSelected() {
-        this.runSelectedFaceOperator('Fill', (mesh, faceIndex) => mesh.fill(faceIndex));
+        this.runSelectedFaceOperator('fill', 'Fill');
     }
 
     gridFillSelected() {
-        this.runSelectedFaceOperator('Grid Fill', (mesh, faceIndex) => mesh.gridFill(faceIndex, 2, 2));
+        this.runSelectedFaceOperator('gridFill', 'Grid Fill', 2, 2);
     }
 
     dissolveSelected() {
-        this.runSelectedFaceOperator('Dissolve', (mesh, faceIndex) => mesh.dissolve(faceIndex));
+        this.runSelectedFaceOperator('dissolve', 'Dissolve');
     }
 
     splitSelected() {
@@ -783,17 +802,21 @@ export class Editor {
             this.ui.setStatus('Select a face first');
             return;
         }
-        const snapshot = this.snapshotScene();
-        let changed = false;
-        faceIndices.forEach(faceIndex => {
-            const splitMesh = this.selected.split(faceIndex, 'x');
-            if (splitMesh) {
-                this.scene.add(splitMesh);
-                changed = true;
-            }
-        });
-        if (changed) this.recordHistorySnapshot(snapshot);
-        else this.ui.setStatus('Split: no change');
+        const sourceMesh = this.selected;
+        const created = [];
+        executeSceneCommand(this, 'Split',
+            () => {
+                faceIndices.forEach(faceIndex => {
+                    const splitMesh = runMeshOperator(sourceMesh, 'split', faceIndex, 'x');
+                    if (splitMesh) created.push(splitMesh);
+                });
+                created.forEach(mesh => this.scene.add(mesh));
+                return created.length;
+            },
+            () => created.forEach(mesh => this.scene.remove(mesh)),
+            () => created.forEach(mesh => this.scene.add(mesh)),
+            count => count > 0
+        );
         this.ui.refreshHierarchy();
     }
 
@@ -803,26 +826,30 @@ export class Editor {
             this.ui.setStatus('Select a face first');
             return;
         }
-        const snapshot = this.snapshotScene();
-        let changed = false;
-        faceIndices.forEach(faceIndex => {
-            const separated = this.selected.separate(faceIndex);
-            if (separated) {
-                this.scene.add(separated);
-                changed = true;
-            }
-        });
-        if (changed) this.recordHistorySnapshot(snapshot);
-        else this.ui.setStatus('Separate: no change');
+        const sourceMesh = this.selected;
+        const created = [];
+        executeSceneCommand(this, 'Separate',
+            () => {
+                faceIndices.forEach(faceIndex => {
+                    const separated = runMeshOperator(sourceMesh, 'separate', faceIndex);
+                    if (separated) created.push(separated);
+                });
+                created.forEach(mesh => this.scene.add(mesh));
+                return created.length;
+            },
+            () => created.forEach(mesh => this.scene.remove(mesh)),
+            () => created.forEach(mesh => this.scene.add(mesh)),
+            count => count > 0
+        );
         this.ui.refreshHierarchy();
     }
 
     triangulateSelected() {
-        this.runSelectedFaceOperator('Triangulate', (mesh, faceIndex) => mesh.triangulate(faceIndex));
+        this.runSelectedFaceOperator('triangulate', 'Triangulate');
     }
 
     quadRebuildSelected() {
-        this.runSelectedFaceOperator('Quad Rebuild', (mesh, faceIndex) => mesh.quadRebuild(faceIndex));
+        this.runSelectedFaceOperator('quadRebuild', 'Quad Rebuild');
     }
 
     recalculateNormalsSelected() {
@@ -831,7 +858,7 @@ export class Editor {
             return;
         }
         const mesh = this.selected;
-        executeMeshCommand(this, mesh, 'Recalculate Normals', () => mesh.recalculateNormals());
+        executeMeshCommand(this, mesh, 'Recalculate Normals', () => runMeshOperator(mesh, 'recalculateNormals'));
     }
 
     flipNormalsSelected() {
@@ -840,7 +867,7 @@ export class Editor {
             return;
         }
         const mesh = this.selected;
-        if (executeMeshCommand(this, mesh, 'Flip Normals', () => mesh.flipNormals())) this.finishMeshEditSelection(mesh);
+        if (executeMeshCommand(this, mesh, 'Flip Normals', () => runMeshOperator(mesh, 'flipNormals'))) this.finishMeshEditSelection(mesh);
     }
 
     addBone(parentIndex = null) {
@@ -848,6 +875,7 @@ export class Editor {
         this.recordHistory();
         const parent = Number.isInteger(parentIndex) ? this.selected.skeleton.bones[parentIndex] : null;
         const bone = this.selected.skeleton.addBone(undefined, parent);
+        this.selected.markDirty('skeletonPose');
         this.selected.selectedBone = this.selected.skeleton.bones.indexOf(bone);
         this.ui.refreshBones();
     }
@@ -856,6 +884,7 @@ export class Editor {
         if (!this.selected) return;
         this.recordHistory();
         if (!this.selected.removeBone(index)) return;
+        this.selected.markDirty('skeletonPose');
         if (this.selected.animationClip) {
             this.selected.animationClip.tracks = this.selected.animationClip.tracks.filter(track => !track.boneName || this.selected.skeleton.find(track.boneName));
         }
@@ -1400,10 +1429,11 @@ export class Editor {
     async undo() {
         const historyEntry = this.undoStack.pop();
         if (!historyEntry) return;
-        if (historyEntry.type === 'mesh-edit') {
+        if (historyEntry.type === 'mesh-edit' || historyEntry.type === 'scene-edit') {
             historyEntry.undo();
             this.redoStack.push(historyEntry);
-            this.refreshAfterMeshCommand(historyEntry.mesh);
+            if (historyEntry.mesh) this.refreshAfterMeshCommand(historyEntry.mesh);
+            else this.ui.refreshHierarchy();
             return;
         }
         this.redoStack.push(this.snapshotScene());
@@ -1413,10 +1443,11 @@ export class Editor {
     async redo() {
         const historyEntry = this.redoStack.pop();
         if (!historyEntry) return;
-        if (historyEntry.type === 'mesh-edit') {
+        if (historyEntry.type === 'mesh-edit' || historyEntry.type === 'scene-edit') {
             historyEntry.redo();
             this.undoStack.push(historyEntry);
-            this.refreshAfterMeshCommand(historyEntry.mesh);
+            if (historyEntry.mesh) this.refreshAfterMeshCommand(historyEntry.mesh);
+            else this.ui.refreshHierarchy();
             return;
         }
         this.undoStack.push(this.snapshotScene());
